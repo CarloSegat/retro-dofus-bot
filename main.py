@@ -47,7 +47,6 @@ to cast again.
 Ctrl+C to abort. All simulated input goes through utils.click / utils.press
 (xdotool); no library calls are made from this module.
 """
-import random
 import sys
 import time
 
@@ -462,6 +461,17 @@ def main():
                 time.sleep(IDLE_POLL_SEC)
                 continue
             d, cell, mob = near
+            # Re-snapshot right before clicking: mobs wander every few seconds
+            # and our `snap` is up to IDLE_POLL_SEC stale. The proxy keeps
+            # s.mobs current via GA0;1; (re-keyed by group_id) and GM|-
+            # (despawn), so we just verify the group we picked is still at
+            # the picked cell -- otherwise we'd click an empty tile and burn
+            # ENGAGE_TIMEOUT before falling back.
+            fresh = state.snapshot().mobs.get(cell)
+            if fresh is None or fresh.group_id != mob.group_id:
+                print(f"[fighter] mob group={mob.group_id} moved/despawned "
+                      f"from cell={cell} before click; re-picking next tick")
+                continue
             x, y = cell_to_screen(cell, cal)
             print(f"[fighter] engaging nearest mob: cell={cell} dist={d} "
                   f"group={mob.group_id} members={mob.members} -> screen=({x},{y})")
@@ -469,20 +479,29 @@ def main():
             if wait_for(state, lambda s: s.in_fight, ENGAGE_TIMEOUT):
                 print(f"[fighter] fight_engage received (phase={state.snapshot().fight_phase})")
                 continue
-            others = [(c, m) for c, m in state.snapshot().mobs.items() if c != cell]
+            # No engage. Re-pick nearest from a *fresh* snapshot (the mob we
+            # just clicked may have moved during our click; the next-nearest
+            # is more useful than a random pick).
+            fresh_snap = state.snapshot()
+            others = [(c, m) for c, m in fresh_snap.mobs.items() if c != cell]
             if not others:
                 print(f"[fighter] no other mob groups to try; sleeping 3s")
                 time.sleep(3.0)
                 continue
-            rcell, rmob = random.choice(others)
-            rx, ry = cell_to_screen(rcell, cal)
-            print(f"[fighter] nearest didn't engage; trying random mob: cell={rcell} "
-                  f"group={rmob.group_id} members={rmob.members} -> screen=({rx},{ry})")
-            ctx.click(rx, ry)
+            me = fresh_snap.my_cell
+            if me:
+                others.sort(key=lambda cm: cell_distance(me, cm[0]))
+            acell, amob = others[0]
+            d2 = cell_distance(me, acell) if me else -1
+            ax, ay = cell_to_screen(acell, cal)
+            print(f"[fighter] nearest didn't engage; trying next-nearest mob: "
+                  f"cell={acell} dist={d2} group={amob.group_id} "
+                  f"members={amob.members} -> screen=({ax},{ay})")
+            ctx.click(ax, ay)
             if wait_for(state, lambda s: s.in_fight, ENGAGE_TIMEOUT):
                 print(f"[fighter] fight_engage received (phase={state.snapshot().fight_phase})")
             else:
-                print(f"[fighter] random click also didn't engage; sleeping 3s")
+                print(f"[fighter] next-nearest also didn't engage; sleeping 3s")
                 time.sleep(3.0)
 
 
