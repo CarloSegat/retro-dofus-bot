@@ -149,18 +149,29 @@ def wait_for_my_turn(state, my_id, last_turn_n, timeout):
     return 0
 
 
-def nearest_mob(snap):
+def nearest_mob(snap, ghosts=()):
     """(distance, cell, mob) for the closest mob group, or None.
+
+    `ghosts` is an iterable of (cell, group_id) tuples we've already tried
+    and failed to engage on the current map; entries matching any tuple
+    are skipped. The proxy fix (handleEngage now removes the engaged group
+    from s.mobs) handles the common case; ghosts catches everything else
+    (groups despawned by other players, missed GM|-, etc.).
 
     If `my_cell` isn't known yet (proxy just attached and we haven't walked
     since), distances are meaningless -- return an arbitrary mob with
     distance=-1 so the caller still engages instead of stalling forever."""
-    if not snap.mobs:
+    ghost_set = set(ghosts)
+    candidates = [
+        (c, m) for c, m in snap.mobs.items()
+        if (c, m.group_id) not in ghost_set
+    ]
+    if not candidates:
         return None
     if snap.my_cell == 0:
-        cell, mob = next(iter(snap.mobs.items()))
+        cell, mob = candidates[0]
         return (-1, cell, mob)
-    items = [(cell_distance(snap.my_cell, c), c, m) for c, m in snap.mobs.items()]
+    items = [(cell_distance(snap.my_cell, c), c, m) for c, m in candidates]
     items.sort(key=lambda t: t[0])
     return items[0]
 
@@ -453,9 +464,22 @@ def main():
         ctx = make_ctx(sct)
         last_status_ts = 0.0
         placed_for_engage_ts = 0.0
+        # Local "ghost" set: (cell, group_id) tuples we've clicked but
+        # failed to engage on the current map. Cleared on map_id change.
+        # The proxy preemptively drops engaged groups from s.mobs, but
+        # this catches everything that slips past (missed GM|-, other
+        # players engaging a group whose despawn we missed, etc.).
+        ghosts = set()
+        last_map_id = snap.map_id
 
         while True:
             snap = state.snapshot()
+            if snap.map_id != last_map_id:
+                if ghosts:
+                    print(f"[fighter] map changed {last_map_id} -> {snap.map_id}; "
+                          f"clearing {len(ghosts)} ghost(s)")
+                ghosts.clear()
+                last_map_id = snap.map_id
 
             if snap.in_combat:
                 ents = snap.fight_entities
@@ -490,12 +514,13 @@ def main():
                 continue
 
             # phase == idle
-            near = nearest_mob(snap)
+            near = nearest_mob(snap, ghosts)
             if near is None:
                 now = time.time()
                 if now - last_status_ts > STATUS_LOG_SEC:
                     print(f"[fighter] phase=idle map={snap.map_id} "
-                          f"my_cell={snap.my_cell} no mobs visible")
+                          f"my_cell={snap.my_cell} no mobs visible "
+                          f"(ghosts={len(ghosts)})")
                     last_status_ts = now
                 time.sleep(IDLE_POLL_SEC)
                 continue
@@ -518,20 +543,19 @@ def main():
             if wait_for(state, lambda s: s.in_fight, ENGAGE_TIMEOUT):
                 print(f"[fighter] fight_engage received (phase={state.snapshot().fight_phase})")
                 continue
-            # No engage. Re-pick nearest from a *fresh* snapshot (the mob we
-            # just clicked may have moved during our click; the next-nearest
-            # is more useful than a random pick).
+            # No engage -> this (cell, group_id) is a ghost; never click it
+            # again until the map changes.
+            ghosts.add((cell, mob.group_id))
+            print(f"[fighter] click on cell={cell} group={mob.group_id} did not "
+                  f"engage; marking ghost (total={len(ghosts)})")
+            # Re-pick nearest from a *fresh* snapshot, excluding ghosts.
             fresh_snap = state.snapshot()
-            others = [(c, m) for c, m in fresh_snap.mobs.items() if c != cell]
-            if not others:
-                print(f"[fighter] no other mob groups to try; sleeping 3s")
+            alt = nearest_mob(fresh_snap, ghosts)
+            if alt is None:
+                print(f"[fighter] no non-ghost mob groups to try; sleeping 3s")
                 time.sleep(3.0)
                 continue
-            me = fresh_snap.my_cell
-            if me:
-                others.sort(key=lambda cm: cell_distance(me, cm[0]))
-            acell, amob = others[0]
-            d2 = cell_distance(me, acell) if me else -1
+            d2, acell, amob = alt
             ax, ay = cell_to_screen(acell, cal)
             print(f"[fighter] nearest didn't engage; trying next-nearest mob: "
                   f"cell={acell} dist={d2} group={amob.group_id} "
@@ -540,7 +564,9 @@ def main():
             if wait_for(state, lambda s: s.in_fight, ENGAGE_TIMEOUT):
                 print(f"[fighter] fight_engage received (phase={state.snapshot().fight_phase})")
             else:
-                print(f"[fighter] next-nearest also didn't engage; sleeping 3s")
+                ghosts.add((acell, amob.group_id))
+                print(f"[fighter] next-nearest also didn't engage; marking ghost "
+                      f"(total={len(ghosts)}); sleeping 3s")
                 time.sleep(3.0)
 
 

@@ -12,6 +12,46 @@ import (
 // movement paths: a-z (0-25), A-Z (26-51), 0-9 (52-61), '-' (62), '_' (63).
 const dofus64 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 
+// Iso-grid geometry mirrors cell_grid.py: 29 cells per sub-row pair, even
+// sub-rows hold 14 cells (no offset), odd hold 15 (half-cell shift).
+const (
+	cellsPerPair = 29
+	evenRowLen   = 14
+)
+
+// cellToUV converts a cell id to (u, v) iso-axis coordinates so we can
+// compute Dofus "Po" distance. See cell_grid.py for the derivation.
+func cellToUV(cell int) (int, int) {
+	pair := cell / cellsPerPair
+	rem := cell % cellsPerPair
+	var subRow, pos int
+	if rem < evenRowLen {
+		subRow = 2 * pair
+		pos = rem
+	} else {
+		subRow = 2*pair + 1
+		pos = rem - evenRowLen
+	}
+	odd := subRow & 1
+	u := (subRow + 2*pos - odd) / 2
+	v := (subRow - 2*pos + odd) / 2
+	return u, v
+}
+
+func absInt(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// cellDistance is the L1 distance in (u, v), matching cell_grid.cell_distance.
+func cellDistance(a, b int) int {
+	ua, va := cellToUV(a)
+	ub, vb := cellToUV(b)
+	return absInt(ua-ub) + absInt(va-vb)
+}
+
 func decodeDofus64Cell(s string) (int, bool) {
 	if len(s) < 2 {
 		return 0, false
@@ -276,7 +316,42 @@ func (s *stateTracker) handleEngage(body string) {
 	if !isMe {
 		return
 	}
+	// Preemptively remove the engaged group from s.mobs. The server doesn't
+	// reliably send GM|-<groupId> at engage time (or the packet boundary
+	// can swallow it), and s.mobs has no other way to clear engaged groups
+	// until the next GDM map change -- leaving "ghost" cells that the bot
+	// will keep clicking. The engaged group is whichever mob group sits
+	// closest (in Po distance) to s.myCell at engage time.
+	s.removeClosestMobToMe("GA;905; engage")
 	s.setPhase(PhasePlacement, "GA;905; engage")
+}
+
+// removeClosestMobToMe deletes the mob group nearest s.myCell, intended to
+// be called at engagement to drop the group we just walked into. No-op if
+// myCell is unknown or s.mobs is empty.
+func (s *stateTracker) removeClosestMobToMe(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.myCell == 0 || len(s.mobs) == 0 {
+		return
+	}
+	bestCell := -1
+	bestDist := 1<<31 - 1
+	var bestID int
+	for cell, mob := range s.mobs {
+		d := cellDistance(s.myCell, cell)
+		if d < bestDist {
+			bestDist = d
+			bestCell = cell
+			bestID = mob.GroupID
+		}
+	}
+	if bestCell < 0 {
+		return
+	}
+	delete(s.mobs, bestCell)
+	log.Printf("[state] removed engaged mob group=%d at cell=%d (po=%d, %s)",
+		bestID, bestCell, bestDist, reason)
 }
 
 // setPhase transitions to the given fight phase, publishing one of three

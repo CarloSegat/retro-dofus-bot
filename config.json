@@ -155,7 +155,7 @@
   "fight_min_blob_pixels": 20,
   "fight_ready_wait_sec": 3.0,
   "pass_turn_hotkey": "e",
-  "turn_start_settle_sec": 1.5,
+  "turn_start_settle_sec": 1.0,
   "attack_match_threshold": 0.85,
   "attack_search_area": [
     [
