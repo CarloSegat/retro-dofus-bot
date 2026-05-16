@@ -1,4 +1,4 @@
-"""Shared helpers: config, screen capture, color match, click, ctx, Esc stop."""
+"""Shared helpers: config, screen capture, click, ctx, Esc stop."""
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,19 +10,10 @@ CFG = json.loads(Path(__file__).with_name("config.json").read_text())
 
 
 def grab_region(sct, x, y, w, h):
+    """RGB ndarray of a screen rectangle. Used by dialogs.py for OCR."""
     mon = {"left": x, "top": y, "width": w, "height": h}
     img = np.array(sct.grab(mon))[:, :, :3]
     return img[:, :, ::-1]
-
-
-def color_ratio(img_rgb, target_rgb, tol):
-    target = np.array(target_rgb, dtype=np.int16)
-    diff = np.abs(img_rgb.astype(np.int16) - target).max(axis=2)
-    return float((diff <= tol).mean())
-
-
-def orange_ratio(img_rgb):
-    return color_ratio(img_rgb, CFG["orange_rgb"], CFG["tolerance"])
 
 
 def click(x, y):
@@ -31,11 +22,7 @@ def click(x, y):
 
 
 def make_ctx(sct):
-    return SimpleNamespace(
-        cfg=CFG, sct=sct,
-        grab_region=grab_region, color_ratio=color_ratio,
-        orange_ratio=orange_ratio, click=click,
-    )
+    return SimpleNamespace(cfg=CFG, sct=sct, grab_region=grab_region, click=click)
 
 
 class EscStop:

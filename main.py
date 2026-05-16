@@ -236,19 +236,19 @@ def main():
         sys.exit(1)
 
     cal = load_cal()
-    print(f"[idle-sacrid] cal: origin=({cal['origin_x']:.1f},{cal['origin_y']:.1f}) "
+    print(f"[fighter] cal: origin=({cal['origin_x']:.1f},{cal['origin_y']:.1f}) "
           f"cell={cal['cell_w']:.2f}x{cal['cell_h']:.2f}")
-    print(f"[idle-sacrid] spell_hotkey={SPELL_HOTKEY!r} ap_cost={FOOT_AP_COST}")
+    print(f"[fighter] spell_hotkey={SPELL_HOTKEY!r} ap_cost={FOOT_AP_COST}")
 
     state = ProxyState(PROXY_ADDR)
     state.start()
-    print(f"[idle-sacrid] connecting to proxy at {PROXY_ADDR}...")
+    print(f"[fighter] connecting to proxy at {PROXY_ADDR}...")
     if not wait_for(state, lambda s: s.connected and s.my_id != 0, 10.0):
         snap = state.snapshot()
-        print(f"[idle-sacrid] proxy not ready: connected={snap.connected} my_id={snap.my_id}")
+        print(f"[fighter] proxy not ready: connected={snap.connected} my_id={snap.my_id}")
         sys.exit(1)
     snap = state.snapshot()
-    print(f"[idle-sacrid] ready: my_id={snap.my_id} my_cell={snap.my_cell} map={snap.map_id}")
+    print(f"[fighter] ready: my_id={snap.my_id} my_cell={snap.my_cell} map={snap.map_id}")
 
     with mss.mss() as sct:
         ctx = make_ctx(sct)
@@ -260,14 +260,14 @@ def main():
             if snap.in_fight:
                 ents = snap.fight_entities
                 others = [e for e in ents.values() if e.id != snap.my_id]
-                print(f"[idle-sacrid] in fight (map={snap.map_id}), "
+                print(f"[fighter] in fight (map={snap.map_id}), "
                       f"entities={len(ents)} enemies={len(others)}, running sacrid combat")
                 run_combat_sacrid(ctx, state, cal)
                 time.sleep(1.0)
                 pyautogui.press("esc")
                 time.sleep(0.3)
                 if not ensure_safe_to_resume(ctx):
-                    print("[idle-sacrid] menu still open after Esc -- aborting")
+                    print("[fighter] menu still open after Esc -- aborting")
                     sys.exit(1)
                 continue
 
@@ -275,32 +275,32 @@ def main():
             if near is None:
                 now = time.time()
                 if now - last_status_ts > STATUS_LOG_SEC:
-                    print(f"[idle-sacrid] map={snap.map_id} my_cell={snap.my_cell} no mobs visible")
+                    print(f"[fighter] map={snap.map_id} my_cell={snap.my_cell} no mobs visible")
                     last_status_ts = now
                 time.sleep(IDLE_POLL_SEC)
                 continue
             d, cell, mob = near
             x, y = cell_to_screen(cell, cal)
-            print(f"[idle-sacrid] engaging nearest mob: cell={cell} dist={d} "
+            print(f"[fighter] engaging nearest mob: cell={cell} dist={d} "
                   f"group={mob.group_id} members={mob.members} -> screen=({x},{y})")
             ctx.click(x, y)
             if wait_for(state, lambda s: s.in_fight, FIGHT_START_TIMEOUT):
-                print(f"[idle-sacrid] fight_start received")
+                print(f"[fighter] fight_start received")
                 continue
             others = [(c, m) for c, m in state.snapshot().mobs.items() if c != cell]
             if not others:
-                print(f"[idle-sacrid] no other mob groups to try; sleeping 3s")
+                print(f"[fighter] no other mob groups to try; sleeping 3s")
                 time.sleep(3.0)
                 continue
             rcell, rmob = random.choice(others)
             rx, ry = cell_to_screen(rcell, cal)
-            print(f"[idle-sacrid] nearest didn't engage; trying random mob: cell={rcell} "
+            print(f"[fighter] nearest didn't engage; trying random mob: cell={rcell} "
                   f"group={rmob.group_id} members={rmob.members} -> screen=({rx},{ry})")
             ctx.click(rx, ry)
             if wait_for(state, lambda s: s.in_fight, FIGHT_START_TIMEOUT):
-                print(f"[idle-sacrid] fight_start received")
+                print(f"[fighter] fight_start received")
             else:
-                print(f"[idle-sacrid] random click also didn't engage; sleeping 3s")
+                print(f"[fighter] random click also didn't engage; sleeping 3s")
                 time.sleep(3.0)
 
 
