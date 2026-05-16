@@ -77,6 +77,11 @@ class Snapshot:
     map_id: int = 0
     my_id: int = 0
     my_cell: int = 0
+    my_life: int = 0           # out-of-fight HP anchor (from server "As" stats packet)
+    my_life_max: int = 0       # out-of-fight max HP (from server "As" stats packet)
+    my_life_anchor_ms: int = 0 # unix ms when my_life was last set (regen basis)
+    my_life_regen_ms: int = 0  # server-stated regen rate from "ILS" packet
+    sitting: bool = False      # true while /sit is active; halves effective regen
     fight_phase: str = "idle"
     mobs: dict = field(default_factory=dict)            # {cell: MobGroup}
     players: dict = field(default_factory=dict)         # {id: Player}
@@ -90,6 +95,47 @@ class Snapshot:
     turn_started_at_ms: int = 0                         # proxy-side ms epoch
     turn_dur_ms: int = 0                                # turn allowance from GTS
     turn_started_local_ts: float = 0.0                  # local time.time() at event
+
+    def effective_regen_ms(self) -> int:
+        """Regen rate after applying sit-state.
+
+        Empirically (Marx-Rockfeller, Dofus retro):
+          - seated:   1 HP / 1000 ms
+          - standing: 1 HP / 2000 ms
+        The server's ILS packet reports the **seated** baseline value,
+        not standing. So while sitting we use the raw rate as-is; while
+        standing we double it. Server doesn't tell us the sit state on
+        the wire -- we infer it from the fact that the bot itself sent
+        /sit (ProxyState.sitting)."""
+        if self.my_life_regen_ms <= 0:
+            return self.my_life_regen_ms
+        if self.sitting:
+            return self.my_life_regen_ms
+        return self.my_life_regen_ms * 2
+
+    def estimated_life(self) -> int:
+        """Anchor HP + extrapolated regen since the anchor.
+
+        Server emits `As` once at fight end (the anchor) and `ILS<ms>`
+        once stating regen rate; no further HP packets arrive while we
+        sit. Computed here as `min(my_life + elapsed_ms/regen_ms, my_life_max)`.
+        Falls back to literal my_life when we have no rate or no anchor
+        (e.g. brand-new proxy session that hasn't seen an As yet) -- the
+        caller's "my_life_max > 0" guard still refuses to engage blind.
+
+        Uses effective_regen_ms so a seated bot gets its 2x regen reflected
+        in the estimate (server only quotes the standing rate)."""
+        if self.my_life_max <= 0:
+            return self.my_life
+        regen = self.effective_regen_ms()
+        if regen <= 0 or self.my_life_anchor_ms <= 0:
+            return self.my_life
+        now_ms = int(time.time() * 1000)
+        elapsed = now_ms - self.my_life_anchor_ms
+        if elapsed <= 0:
+            return self.my_life
+        gained = elapsed // regen
+        return min(self.my_life + int(gained), self.my_life_max)
 
     @property
     def in_combat(self) -> bool:
@@ -134,6 +180,14 @@ class ProxyState:
             self._thread.join(timeout=2)
             self._thread = None
 
+    def set_sitting(self, sitting: bool):
+        """Local-only sit-state flag. Set True right after the bot sends
+        /sit; cleared automatically on fight_engage (entering combat
+        forces the character to stand). Halves the effective HP regen
+        rate inside Snapshot.estimated_life()."""
+        with self._lock:
+            self._snap.sitting = sitting
+
     def snapshot(self) -> Snapshot:
         with self._lock:
             return Snapshot(
@@ -141,6 +195,11 @@ class ProxyState:
                 map_id=self._snap.map_id,
                 my_id=self._snap.my_id,
                 my_cell=self._snap.my_cell,
+                my_life=self._snap.my_life,
+                my_life_max=self._snap.my_life_max,
+                my_life_anchor_ms=self._snap.my_life_anchor_ms,
+                my_life_regen_ms=self._snap.my_life_regen_ms,
+                sitting=self._snap.sitting,
                 fight_phase=self._snap.fight_phase,
                 mobs=dict(self._snap.mobs),
                 players=dict(self._snap.players),
@@ -207,6 +266,10 @@ class ProxyState:
                 self._snap.map_id = ev.get("map_id", 0)
                 self._snap.my_id = ev.get("my_id", 0)
                 self._snap.my_cell = ev.get("my_cell", 0)
+                self._snap.my_life = ev.get("my_life", 0)
+                self._snap.my_life_max = ev.get("my_life_max", 0)
+                self._snap.my_life_anchor_ms = ev.get("my_life_anchor_ms", 0)
+                self._snap.my_life_regen_ms = ev.get("my_life_regen_ms", 0)
                 self._snap.fight_phase = ev.get("fight_phase", "idle")
                 self._snap.mobs = {
                     m["cell"]: MobGroup(m["cell"], m["group_id"], m.get("members", []))
@@ -235,6 +298,8 @@ class ProxyState:
             elif t == "fight_engage":
                 self._snap.fight_phase = ev.get("phase", "placement")
                 self._snap.last_fight_engage_ts = now
+                # Entering combat forces the character to stand up.
+                self._snap.sitting = False
             elif t == "fight_start":
                 self._snap.fight_phase = ev.get("phase", "combat")
                 self._snap.last_fight_start_ts = now

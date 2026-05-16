@@ -27,9 +27,12 @@ those helpers.
   adjacent and `ap >= sacrid_foot_ap_cost`, pass. One cast per turn
   (game cooldown). All targeting/AP off proxy GTM data, no screen
   detection.
-- `calibrate_cells.py [N]` — proxy-driven cell→screen calibration. Click N cells,
-  walks character there, fits `(origin_x, origin_y, cell_w, cell_h)`. Writes
-  `config.json.cell_calibration`. Run once per window size.
+- `calibrate_map_cells.py <world_x> <world_y> [N]` — per-map calibration.
+  Phase 1: click N (default 2) starting cells. Phase 2: click the N/E/S/W
+  switch-map cells (press `s` to skip a direction the map lacks).
+  Phase 3: click obstacle cells, Esc when done. Writes
+  `map_data/<world_x>_<world_y>.json` (cells / switch_cells / obstacles).
+  Depends on `config.json.cell_calibration` being already populated.
 - `ignore_challenges_and_trades.py` — optional standalone helper that
   polls for trade/challenge popups and clicks Ignore. Runs in parallel
   to `main.py`.
@@ -47,8 +50,9 @@ grid:
   `cell_grid.cell_distance(a, b)` (Dofus "Po" range, L1 in iso (u,v) basis),
   and `cell_grid.neighbors(cell)` (the 4 edge-adjacent cells, used by
   the Sacrid loop's walk-to-adjacent step).
-- Calibration is per-window-size; re-run `calibrate_cells.py` if you resize
-  the game.
+- `cell_calibration` in `config.json` is per-window-size; if you resize
+  the game it must be re-derived (no script ships for that today — pull
+  the old `calibrate_cells.py` from git if you need to refit).
 
 ## Fight state is a tri-state machine
 
@@ -108,8 +112,8 @@ sudo go run ./proxy/cmd/proxy --events 127.0.0.1:9999 2>&1 | tee /tmp/proxy.log
 
 # Terminal 2: launch Dofus, log in, pick character (proxy must see ASK)
 
-# Terminal 3: calibrate once per window size
-python3 -u calibrate_cells.py 5
+# Terminal 3: calibrate a new map (starts, NSEW exits, obstacles)
+python3 -u calibrate_map_cells.py <world_x> <world_y> [N]
 
 # Terminal 3: run the fighter
 python3 -u main.py
@@ -117,7 +121,7 @@ python3 -u main.py
 
 ## Config knobs (config.json)
 
-- `cell_calibration`: written by `calibrate_cells.py`. Don't hand-edit.
+- `cell_calibration`: pixel-to-cell transform. Don't hand-edit.
 - `pass_turn_hotkey`: single key name (string), default `"e"`. Passed to
   xdotool via `utils.press`.
 - `sacrid_foot_hotkey`: key for Marx-Rockfeller's Sacrid Foot slot

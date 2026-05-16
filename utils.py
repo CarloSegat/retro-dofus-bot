@@ -9,7 +9,7 @@ with spell-aim casts), debug THAT case in isolation -- don't replace
 the library wholesale; the working clicks are too important to risk.
 
 pynput is imported only for event capture (keyboard.Listener in
-EscStop / calibrate_cells.py). pyautogui can inject but can't listen."""
+EscStop / calibrate_map_cells.py). pyautogui can inject but can't listen."""
 import json
 import subprocess
 import time
@@ -121,6 +121,23 @@ def press_xdotool(key, hold_sec=0.1):
     subprocess.run(args_down, check=True)
     time.sleep(hold_sec)
     subprocess.run(args_up, check=True)
+
+
+def type_xdotool(text, delay_ms=20):
+    """Type a literal string into the Dofus window via xdotool.
+
+    Used for chat commands like "/sit" -- press Enter first to open the
+    chat, type the command, press Enter again to send. We windowactivate
+    so xdotool's `type` lands in Dofus rather than the terminal; without
+    focus, Wine drops synthetic input."""
+    wid = dofus_window_id()
+    if wid:
+        subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=False)
+    args = ["xdotool", "type", "--delay", str(delay_ms)]
+    if wid:
+        args += ["--window", wid]
+    args.append(text)
+    subprocess.run(args, check=True)
 
 
 def make_ctx(sct):

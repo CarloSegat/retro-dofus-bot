@@ -192,6 +192,7 @@
   "sacrid_foot_ap_cost": 4,
   "sacrid_buff_hotkey": "3",
   "sacrid_buff_ap_cost": 3,
+  "sacrid_buff_max_dist": 7,
   "sacrid_cast_wait_sec": 0.8,
   "sacrid_walk_wait_sec": 2.0,
   "sacrid_walk_step_wait_sec": 2.5,

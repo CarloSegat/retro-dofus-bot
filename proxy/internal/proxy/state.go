@@ -116,6 +116,10 @@ type stateTracker struct {
 	mapID         int
 	myID          int
 	myCell        int
+	myLife          int   // out-of-fight current HP, anchor from server "As" packet
+	myLifeMax       int   // out-of-fight max HP, from server "As" packet
+	myLifeAnchorMs  int64 // unix ms when myLife was set (basis for regen estimate)
+	myLifeRegenMs   int   // server-stated regen rate (ms per HP) from "ILS<n>" packet
 	phase         FightPhase
 	mobs          map[int]MobGroup    // keyed by cell
 	players       map[int]Player      // keyed by player id
@@ -216,6 +220,19 @@ func (s *stateTracker) Apply(pkt string) {
 		// time we see GTS the snapshot is already current. When
 		// <actorId> == myID the bot may begin acting.
 		s.applyGTS(pkt[3:])
+	case strings.HasPrefix(pkt, "As") && len(pkt) > 2 && pkt[2] >= '0' && pkt[2] <= '9':
+		// Player stats packet. Format:
+		//   As<xp>,<xpLow>,<xpNext>|<kamas>|<statsPts>|<spellPts>|<align>|<life,maxLife>|<energy,maxEnergy>|...
+		// Server pushes one whenever a stat changes (post-fight, level
+		// up, pickup). Field index 5 (0-based, pipe-split) is the
+		// "<life>,<maxLife>" pair -- our out-of-fight HP source.
+		s.applyAs(pkt[2:])
+	case strings.HasPrefix(pkt, "ILS"):
+		// Out-of-fight HP regen rate, in ms per +1 HP. Server fires it
+		// once right after the post-fight "As" anchor; no further HP
+		// packets arrive while we sit. Without parsing this we'd be
+		// stuck forever at the anchor HP. Client/proxy must time-extrapolate.
+		s.applyILS(pkt[3:])
 	}
 }
 
@@ -448,6 +465,60 @@ func atoiSafe(s string) int {
 	return n
 }
 
+// applyAs parses the body of an "As..." stats packet and extracts the
+// player's current and max life (field index 5, 0-based, split by '|').
+// Only re-emits a snapshot when life actually changed -- the server
+// fires As for unrelated changes (xp, kamas, etc.) and we don't want
+// to spam JSON events.
+func (s *stateTracker) applyAs(body string) {
+	fields := strings.Split(body, "|")
+	if len(fields) <= 5 {
+		return
+	}
+	life := strings.SplitN(fields[5], ",", 2)
+	if len(life) != 2 {
+		return
+	}
+	cur, err1 := strconv.Atoi(life[0])
+	max, err2 := strconv.Atoi(life[1])
+	if err1 != nil || err2 != nil {
+		return
+	}
+	nowMs := time.Now().UnixMilli()
+	s.mu.Lock()
+	changed := s.myLife != cur || s.myLifeMax != max
+	s.myLife = cur
+	s.myLifeMax = max
+	// Stamp the anchor unconditionally: even if HP didn't change, the
+	// server is asserting "this is your HP right now" so the regen
+	// extrapolation must restart from this moment.
+	s.myLifeAnchorMs = nowMs
+	s.mu.Unlock()
+	if changed {
+		s.emitSnapshot()
+	}
+}
+
+// applyILS consumes the body of an "ILS<ms>" packet -- the server-stated
+// out-of-fight HP regen rate in milliseconds per +1 HP. Empirically this
+// is the SEATED baseline (1 HP / 1000 ms on Marx-Rockfeller); standing
+// regen is half that speed (1 HP / 2000 ms). Python applies the doubling
+// via Snapshot.effective_regen_ms based on ProxyState.sitting -- raw
+// value passes through here unmodified. Server emits it exactly once
+// right after each post-fight "As" anchor and never sends further HP
+// updates while we sit, so Python has to extrapolate from (anchor, rate).
+// Always emits a snapshot so the rate change propagates.
+func (s *stateTracker) applyILS(body string) {
+	ms, err := strconv.Atoi(strings.TrimSpace(body))
+	if err != nil || ms <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.myLifeRegenMs = ms
+	s.mu.Unlock()
+	s.emitSnapshot()
+}
+
 // applyGTS consumes the body of a "GTS<actorId>|<dur_ms>|<turn_n>" packet
 // (no leading "GTS"). Updates turn state and emits a lightweight
 // "turn_start" event with the receive-time wall clock so the bot can
@@ -640,6 +711,10 @@ func (s *stateTracker) emitSnapshot() {
 		"map_id":             s.mapID,
 		"my_id":              s.myID,
 		"my_cell":            s.myCell,
+		"my_life":            s.myLife,
+		"my_life_max":        s.myLifeMax,
+		"my_life_anchor_ms":  s.myLifeAnchorMs,
+		"my_life_regen_ms":   s.myLifeRegenMs,
 		"fight_phase":        string(s.phase),
 		"mobs":               mobs,
 		"players":            players,

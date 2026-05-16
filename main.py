@@ -2,9 +2,22 @@
 
 Character: Marx-Rockfeller (Sacrieur), berlinthree Ankama account.
 
+Usage:
+  python3 -u main.py [--min-hp HP] [--max-group-size N]
+
+Args:
+  --min-hp HP           Block engaging a new mob until current HP >= HP
+                        (capped at max HP). Default 100. HP is learned from
+                        the server "As" stats packet, which fires on any stat
+                        change (post-fight, level-up, pickup) -- if the proxy
+                        hasn't seen one yet, the bot refuses to engage rather
+                        than attacking blind.
+  --max-group-size N    Ignore mob groups whose member count > N. Default 0
+                        (no cap). E.g. 3 means refuse to engage groups of 4+.
+
 Pre-reqs:
   - Go proxy running on 127.0.0.1:9999.
-  - config.json has cell_calibration (run calibrate_cells.py).
+  - config.json has cell_calibration.
   - config.sacrid_foot_hotkey is set to whatever 1-9 slot the spell lives
     in on Marx-Rockfeller's spell bar.
 
@@ -56,6 +69,8 @@ don't try to cast it again. Strength Punishment is cast once on turn 1
 Ctrl+C to abort. All simulated input goes through utils.click / utils.press
 (xdotool); no library calls are made from this module.
 """
+import argparse
+import random
 import sys
 import time
 
@@ -64,11 +79,19 @@ import mss
 from cell_grid import a_star, cell_distance, cell_to_xy, neighbors
 from dialogs import ensure_safe_to_resume
 from fight import pass_turn
-from map_data import load_all as load_map_data
+from map_data import (
+    DIRECTION_WORLD_DELTA,
+    OPPOSITE_DIRECTION,
+    build_world_index,
+    load_all as load_map_data,
+    safe_directions,
+    target_map_id,
+)
 from proxy_client import ProxyState
-from utils import CFG, click, make_ctx, press, press_xdotool
+from utils import CFG, click, make_ctx, press, press_xdotool, type_xdotool
 
 MAP_DATA = load_map_data()  # {map_id: {"world", "map_id", "cells", "obstacles", ...}}
+MAP_BY_WORLD = build_world_index(MAP_DATA)  # {(world_x, world_y): entry}
 
 PROXY_ADDR = "127.0.0.1:9999"
 
@@ -78,6 +101,13 @@ FOOT_AP_COST = int(CFG.get("sacrid_foot_ap_cost", 4))
 # the start of each fight. Self-target -- hotkey + click own cell.
 BUFF_HOTKEY = CFG.get("sacrid_buff_hotkey", "3")
 BUFF_AP_COST = int(CFG.get("sacrid_buff_ap_cost", 3))
+# Don't cast Strength Punishment if the nearest enemy is FURTHER than this
+# many cells (Po) away. Reason: the buff only triggers when we take damage,
+# and damage only starts arriving once enemies are close. If the nearest mob
+# is too far out we'll burn the buff window walking toward it and the spell
+# will expire before we ever get hit. Cast when nearest <= threshold (mobs
+# close enough we'll be in melee very soon); skip when nearest > threshold.
+BUFF_MAX_DIST = int(CFG.get("sacrid_buff_max_dist", 6))
 CAST_WAIT_SEC = float(CFG.get("sacrid_cast_wait_sec", 0.8))
 WALK_WAIT_SEC = float(CFG.get("sacrid_walk_wait_sec", 2.0))
 WALK_STEP_WAIT_SEC = float(CFG.get("sacrid_walk_step_wait_sec", 1.0))
@@ -112,12 +142,31 @@ ENGAGE_TIMEOUT = 5.0
 COMBAT_START_TIMEOUT = 35.0
 IDLE_POLL_SEC = 0.5
 STATUS_LOG_SEC = 5.0
+# Upper bound on how long we'll wait after clicking a switch-map cell for
+# either the proxy to report a new map_id or for us to aggro mid-walk.
+# A full map traversal is ~6-8 cells at ~0.5s per cell; 20s covers that
+# plus the GDM round-trip with margin.
+MAP_CHANGE_TIMEOUT = 20.0
+# After we find no valid mob on a map, remember it for this long before
+# being willing to walk back. Prevents ping-ponging into an empty
+# dead-end map when its only safe exit leads back to where we came from.
+# Mob group respawn in Dofus retro is several minutes; default 4 min.
+EMPTY_MAP_RESPAWN_SEC = float(CFG.get("empty_map_respawn_sec", 240.0))
+
+# HP-gate before engaging. The proxy only learns our HP from an "As"
+# stats packet, which fires on any stat change (post-fight XP/HP, level
+# up, kamas pickup). If we haven't seen one yet, my_life_max == 0 and
+# we REFUSE to engage rather than attacking blind -- complete any stat
+# change (e.g. finish one fight) to populate it.
+HP_WAIT_TIMEOUT = 300.0
+HP_POLL_SEC = 1.0
+HP_LOG_SEC = 10.0
 
 
 def load_cal():
     cal = CFG.get("cell_calibration")
     if not cal:
-        print("missing cell_calibration in config.json. Run calibrate_cells.py.")
+        print("missing cell_calibration in config.json.")
         sys.exit(1)
     return cal
 
@@ -152,7 +201,87 @@ def wait_for_my_turn(state, my_id, last_turn_n, timeout):
     return 0
 
 
-def nearest_mob(snap, ghosts=()):
+def sit_for_regen(state):
+    """Send /sit via chat and mark ProxyState.sitting=True.
+
+    Pre-condition: we are currently STANDING. /sit is a toggle so the
+    caller must know this -- combat auto-stands, so by the time
+    wait_for_hp invokes us we're known standing. Cleared automatically
+    on fight_engage."""
+    print("[fighter] /sit to regen faster")
+    press_xdotool("Return")
+    time.sleep(0.3)
+    type_xdotool("/sit")
+    time.sleep(0.3)
+    press_xdotool("Return")
+    state.set_sitting(True)
+
+
+def wait_for_hp(state, min_hp):
+    """Block until we KNOW our HP and it's >= min(min_hp, my_life_max).
+
+    Returns True only when both conditions hold. Returns False if we
+    enter a fight while waiting (caller's combat branch picks up) or if
+    the timeout fires without ever seeing HP info -- in which case we
+    refuse to engage, because engaging blind is exactly the bug this
+    function prevents.
+
+    HP is computed via Snapshot.estimated_life(): anchor (last "As"
+    packet) + elapsed-time / regen_ms (last "ILS" packet). The server
+    only emits a fresh As at stat changes (post-fight/level/pickup),
+    so without this extrapolation we'd freeze at the post-fight HP and
+    never engage again.
+
+    Sit-once: /sit is sent the first iteration we're below threshold
+    and stays on until fight_engage stands us back up."""
+    deadline = time.time() + HP_WAIT_TIMEOUT
+    announced = False
+    last_log = 0.0
+    sat_down = False
+    while time.time() < deadline:
+        snap = state.snapshot()
+        if snap.in_fight:
+            print(f"[fighter] entered fight while waiting for HP; aborting wait")
+            return False
+        if snap.my_life_max > 0:
+            cap = min(min_hp, snap.my_life_max)
+            est = snap.estimated_life()
+            eff = snap.effective_regen_ms()
+            rate_str = (f"regen={eff}ms/hp (sitting, raw={snap.my_life_regen_ms})"
+                        if snap.sitting else f"regen={eff}ms/hp")
+            if est >= cap:
+                if announced:
+                    print(f"[fighter] HP ~{est}/{snap.my_life_max} >= {cap}; engaging "
+                          f"(anchor={snap.my_life}, {rate_str})")
+                return True
+            # Below threshold -> sit for regen. One-shot: don't re-sit
+            # on every iteration.
+            if not sat_down and not snap.sitting:
+                sit_for_regen(state)
+                sat_down = True
+                continue
+            if not announced:
+                print(f"[fighter] HP ~{est}/{snap.my_life_max} below threshold {cap}; "
+                      f"waiting (anchor={snap.my_life}, {rate_str})")
+                announced = True
+                last_log = time.time()
+            elif time.time() - last_log >= HP_LOG_SEC:
+                print(f"[fighter] still regenerating: HP ~{est}/{snap.my_life_max} (need {cap})")
+                last_log = time.time()
+        else:
+            if not announced or time.time() - last_log >= HP_LOG_SEC:
+                print(f"[fighter] no HP info from proxy yet (no 'As' packet seen); "
+                      f"holding engage. Complete any stat change to populate it.")
+                announced = True
+                last_log = time.time()
+        time.sleep(HP_POLL_SEC)
+    snap = state.snapshot()
+    print(f"[fighter] HP wait timed out after {HP_WAIT_TIMEOUT}s at "
+          f"~{snap.estimated_life()}/{snap.my_life_max}; refusing to engage blind")
+    return False
+
+
+def nearest_mob(snap, ghosts=(), max_group_size=0):
     """(distance, cell, mob) for the closest mob group, or None.
 
     `ghosts` is an iterable of (cell, group_id) tuples we've already tried
@@ -161,6 +290,9 @@ def nearest_mob(snap, ghosts=()):
     from s.mobs) handles the common case; ghosts catches everything else
     (groups despawned by other players, missed GM|-, etc.).
 
+    `max_group_size`: if > 0, skip groups with more than this many members.
+    0 (default) means no cap.
+
     If `my_cell` isn't known yet (proxy just attached and we haven't walked
     since), distances are meaningless -- return an arbitrary mob with
     distance=-1 so the caller still engages instead of stalling forever."""
@@ -168,6 +300,7 @@ def nearest_mob(snap, ghosts=()):
     candidates = [
         (c, m) for c, m in snap.mobs.items()
         if (c, m.group_id) not in ghost_set
+        and (max_group_size <= 0 or len(m.members) <= max_group_size)
     ]
     if not candidates:
         return None
@@ -385,11 +518,19 @@ def run_combat_sacrid(ctx, state, cal):
          rendering the new turn (highlight, AP/MP bars). Acting earlier
          risks the spell hotkey or click landing while the previous
          actor's end-of-turn animation still has input focus.
-      1. First eligible turn only: self-cast Strength Punishment (buff)
-         once per fight, then locally decrement AP by BUFF_AP_COST so the
-         rest of the turn budgets correctly. GTM only refreshes AP at
-         turn boundaries, so we can't re-read it mid-turn.
-      2. Find closest alive enemy from proxy fight_entities.
+      1. First turn the nearest enemy is <= BUFF_MAX_DIST cells away:
+         self-cast Strength Punishment (buff) once per fight, then
+         locally decrement AP by BUFF_AP_COST so the rest of the turn
+         budgets correctly. GTM only refreshes AP at turn boundaries,
+         so we can't re-read it mid-turn. If the nearest enemy is too
+         far we skip the buff -- it triggers on damage taken, and we
+         won't be taking damage until they close the gap; the buff
+         would expire before paying off.
+      2. Pick the locked target. The first turn we pick the closest alive
+         enemy and remember its id (or its starting cell if id is missing);
+         every subsequent turn we keep attacking that same target until
+         it dies, only then re-picking. Prevents flip-flopping between
+         mobs when a different one wanders closer mid-fight.
       3. If not adjacent, mini-step toward it (1 MP per click).
       4. If adjacent and AP >= FOOT_AP_COST, cast Foot once (hotkey +
          target-click).
@@ -401,6 +542,12 @@ def run_combat_sacrid(ctx, state, cal):
     my_id = state.snapshot().my_id
     last_turn_n = 0
     buff_cast = False
+    # Locked target across turns. `locked_target_id` is preferred; we fall
+    # back to `locked_target_cell` only if the entity has no id (shouldn't
+    # happen with current proxy parsing, but keeps the rule "same mob until
+    # dead" robust). Reset when the target dies/disappears.
+    locked_target_id = 0
+    locked_target_cell = 0
     # Static obstacles are calibrated per-map and don't move; load once.
     map_id = state.snapshot().map_id
     static_obstacles = set((MAP_DATA.get(map_id) or {}).get("obstacles") or ())
@@ -425,23 +572,59 @@ def run_combat_sacrid(ctx, state, cal):
         my_ap = me.ap if me else 0
         my_mp = me.mp if me else 0
 
-        if not buff_cast and me_cell and my_ap >= BUFF_AP_COST:
-            cast_strength_punishment(me_cell, cal)
-            time.sleep(CAST_WAIT_SEC)
-            my_ap -= BUFF_AP_COST
-            buff_cast = True
-            print(f"  buff cast; ap_left~{my_ap}")
-
         enemies = alive_enemies(snap)
         if not enemies:
             print("  no alive enemies in snapshot; passing")
             pass_turn(ctx)
             continue
 
-        target = enemies[0]
+        # Buff gating: cast Strength Punishment once per fight, but only
+        # on a turn where the nearest enemy is within BUFF_MAX_DIST. The
+        # buff only triggers when WE take damage; if all enemies are far
+        # away we'll spend the buff window walking and the spell expires
+        # before anyone hits us. Re-checked every turn until they close
+        # the gap (or never, in which case we just don't buff this fight).
+        nearest_dist = (cell_distance(me_cell, enemies[0].cell)
+                        if me_cell else 99)
+        if not buff_cast and me_cell and my_ap >= BUFF_AP_COST:
+            if nearest_dist <= BUFF_MAX_DIST:
+                print(f"  buff: nearest_dist={nearest_dist} <= {BUFF_MAX_DIST}, casting")
+                cast_strength_punishment(me_cell, cal)
+                time.sleep(CAST_WAIT_SEC)
+                my_ap -= BUFF_AP_COST
+                buff_cast = True
+                print(f"  buff cast; ap_left~{my_ap}")
+            else:
+                print(f"  buff: nearest_dist={nearest_dist} > {BUFF_MAX_DIST}, "
+                      f"skipping (too far -- buff would expire before we get hit)")
+
+        # Lock-on logic: re-use the previous target if it's still alive in
+        # the current snapshot. Match by id first; if id is missing/0,
+        # match by the cell we last saw it on. Only re-pick when the
+        # locked target is gone (dead or despawned).
+        target = None
+        if locked_target_id:
+            t = snap.fight_entities.get(locked_target_id)
+            if t and t.alive and t.cell > 0:
+                target = t
+        if target is None and locked_target_cell:
+            for e in enemies:
+                if e.cell == locked_target_cell:
+                    target = e
+                    break
+
+        if target is None:
+            target = enemies[0]
+            locked_target_id = target.id
+            locked_target_cell = target.cell
+            print(f"  locked new target id={target.id} cell={target.cell}")
+        else:
+            # Refresh cell anchor in case the mob walked between turns.
+            locked_target_cell = target.cell
+
         dist = cell_distance(me_cell, target.cell) if me_cell else 99
         print(f"  target id={target.id} cell={target.cell} dist={dist} "
-              f"my_cell={me_cell} my_ap={my_ap} my_mp={my_mp}")
+              f"my_cell={me_cell} my_ap={my_ap} my_mp={my_mp} (locked)")
 
         if dist > 1 and me_cell and my_mp > 0:
             # walk_toward returns (me_cell, my_ap) but walking doesn't
@@ -467,6 +650,15 @@ def run_combat_sacrid(ctx, state, cal):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Proxy-driven Sacrieur auto-fighter")
+    parser.add_argument("--min-hp", type=int, default=100,
+                        help="wait until current HP >= this before engaging "
+                             "(default 100; capped at max HP)")
+    parser.add_argument("--max-group-size", type=int, default=0,
+                        help="skip mob groups with more than N members "
+                             "(default 0 = no cap). E.g. 3 ignores groups of 4+.")
+    args = parser.parse_args()
+
     if not SPELL_HOTKEY:
         print("config.json is missing 'sacrid_foot_hotkey'. Set it to the key "
               "Sacrid Foot is bound to on Marx-Rockfeller's spell bar (e.g. \"1\").")
@@ -476,6 +668,18 @@ def main():
     print(f"[fighter] cal: origin=({cal['origin_x']:.1f},{cal['origin_y']:.1f}) "
           f"cell={cal['cell_w']:.2f}x{cal['cell_h']:.2f}")
     print(f"[fighter] spell_hotkey={SPELL_HOTKEY!r} ap_cost={FOOT_AP_COST}")
+    print(f"[fighter] min-hp threshold: wait until >= {args.min_hp} HP before engaging")
+    if args.max_group_size > 0:
+        print(f"[fighter] max-group-size: skip mob groups with > {args.max_group_size} members")
+    else:
+        print(f"[fighter] max-group-size: no cap (engaging any group size)")
+
+    with_switches = sum(1 for d in MAP_DATA.values() if d.get("switch_cells"))
+    with_safe = sum(1 for d in MAP_DATA.values()
+                    if safe_directions(d, MAP_BY_WORLD))
+    print(f"[fighter] navigation: {len(MAP_DATA)} map(s) calibrated, "
+          f"{with_switches} have switch_cells, "
+          f"{with_safe} have >= 1 return-safe neighbour")
 
     state = ProxyState(PROXY_ADDR)
     state.start()
@@ -498,6 +702,18 @@ def main():
         # players engaging a group whose despawn we missed, etc.).
         ghosts = set()
         last_map_id = snap.map_id
+        # Direction we most recently used to leave a map via a switch
+        # cell. Used to avoid immediately walking back (we exclude the
+        # opposite direction on the next map) so the bot doesn't ping-pong
+        # between two empty maps. None until the first navigate-out.
+        last_walk_direction = None
+        # {map_id: time.time() when we last found no valid mob on it}.
+        # Filtered against when picking a navigation target so we don't
+        # walk back into a map that's known empty (or all-filtered by
+        # max-group-size). Entries effectively expire after
+        # EMPTY_MAP_RESPAWN_SEC; cleared eagerly whenever we engage a
+        # mob on a map (proves it has valid mobs again).
+        recently_empty_maps: dict[int, float] = {}
 
         while True:
             snap = state.snapshot()
@@ -514,9 +730,13 @@ def main():
                 print(f"[fighter] phase=combat (map={snap.map_id}) "
                       f"entities={len(ents)} enemies={len(others)}, running sacrid combat")
                 run_combat_sacrid(ctx, state, cal)
-                # Wait for the XP-summary popup to actually finish
-                # rendering before we Esc it; 1s was too short.
+                # End-of-fight cleanup: Enter first to dismiss any level-up
+                # popup (no-op if absent), then 1s gap so the XP-summary
+                # gets focus, then Esc to dismiss it. The 4s pre-wait lets
+                # both popups finish rendering before we send input.
                 time.sleep(4.0)
+                press_xdotool("Return")
+                time.sleep(1.0)
                 press_xdotool("Escape")
                 time.sleep(0.3)
                 if not ensure_safe_to_resume(ctx):
@@ -541,17 +761,91 @@ def main():
                 continue
 
             # phase == idle
-            near = nearest_mob(snap, ghosts)
+            near = nearest_mob(snap, ghosts, args.max_group_size)
             if near is None:
+                # No valid mob to engage (either nothing visible, or every
+                # group is filtered out by --max-group-size). Try to walk
+                # to the next map via a calibrated NSEW switch cell.
+                entry = MAP_DATA.get(snap.map_id) or {}
+                switch_cells_map = entry.get("switch_cells") or {}
+                # Mark the current map as recently empty so we (or a
+                # neighbour) won't ping-pong straight back into it.
+                recently_empty_maps[snap.map_id] = time.time()
+                safe = safe_directions(entry, MAP_BY_WORLD) if switch_cells_map else []
                 now = time.time()
+                # Drop expired entries opportunistically so the dict
+                # doesn't grow unbounded on long sessions.
+                recently_empty_maps = {
+                    mid: ts for mid, ts in recently_empty_maps.items()
+                    if now - ts < EMPTY_MAP_RESPAWN_SEC
+                }
+                # Filter safe directions whose target is in cooldown.
+                fresh = [
+                    d for d in safe
+                    if (tmid := target_map_id(entry, d, MAP_BY_WORLD)) is None
+                    or tmid not in recently_empty_maps
+                ]
+                if fresh:
+                    excluded = OPPOSITE_DIRECTION.get(last_walk_direction)
+                    preferred = [d for d in fresh if d != excluded]
+                    direction = random.choice(preferred or fresh)
+                    switch_cell = switch_cells_map[direction]
+                    x, y = cell_to_screen(switch_cell, cal)
+                    total = len(snap.mobs)
+                    reason = (f"{total} group(s) all filtered by "
+                              f"max-group-size={args.max_group_size}"
+                              if args.max_group_size > 0 and total > 0
+                              else "no mobs visible")
+                    skipped = [d for d in safe if d not in fresh]
+                    skip_note = (f", skipping {skipped} (target map recently empty)"
+                                 if skipped else "")
+                    print(f"[fighter] phase=idle map={snap.map_id}: {reason}; "
+                          f"walking {direction} (fresh={fresh}{skip_note}, "
+                          f"avoid={excluded}) to switch cell={switch_cell} "
+                          f"-> ({x},{y})")
+                    ctx.click(x, y)
+                    last_walk_direction = direction
+                    before_map = snap.map_id
+                    if wait_for(state,
+                                lambda s, bm=before_map: (s.map_id != bm and s.map_id != 0)
+                                                          or s.in_fight,
+                                MAP_CHANGE_TIMEOUT):
+                        ns = state.snapshot()
+                        if ns.in_fight:
+                            print(f"[fighter] aggroed while walking {direction}; "
+                                  f"phase={ns.fight_phase}")
+                        else:
+                            print(f"[fighter] map changed {before_map} -> {ns.map_id} "
+                                  f"via {direction}")
+                    else:
+                        print(f"[fighter] walk to {direction} switch cell did not "
+                              f"change map in {MAP_CHANGE_TIMEOUT}s; will retry "
+                              f"next tick")
+                    continue
                 if now - last_status_ts > STATUS_LOG_SEC:
+                    total = len(snap.mobs)
+                    cap_note = (f" (filtered by max-group-size={args.max_group_size};"
+                                f" total_visible={total})"
+                                if args.max_group_size > 0 and total > 0 else "")
+                    if not switch_cells_map:
+                        nav_note = "no switch_cells calibrated for this map"
+                    elif not safe:
+                        nav_note = (f"switch_cells={list(switch_cells_map.keys())} but "
+                                    f"no return-safe neighbour (target maps un-calibrated "
+                                    f"or missing return switch)")
+                    else:
+                        nav_note = (f"safe={safe} but every target is in cooldown "
+                                    f"(empty within {int(EMPTY_MAP_RESPAWN_SEC)}s); "
+                                    f"waiting for respawn")
                     print(f"[fighter] phase=idle map={snap.map_id} "
                           f"my_cell={snap.my_cell} no mobs visible "
-                          f"(ghosts={len(ghosts)})")
+                          f"(ghosts={len(ghosts)}){cap_note}; {nav_note}")
                     last_status_ts = now
                 time.sleep(IDLE_POLL_SEC)
                 continue
             d, cell, mob = near
+            # A valid mob exists on this map -- it's no longer "recently empty".
+            recently_empty_maps.pop(snap.map_id, None)
             # Re-snapshot right before clicking: mobs wander every few seconds
             # and our `snap` is up to IDLE_POLL_SEC stale. The proxy keeps
             # s.mobs current via GA0;1; (re-keyed by group_id) and GM|-
@@ -563,9 +857,16 @@ def main():
                 print(f"[fighter] mob group={mob.group_id} moved/despawned "
                       f"from cell={cell} before click; re-picking next tick")
                 continue
+            if not wait_for_hp(state, args.min_hp):
+                # Either aggroed (next tick's in_fight branch handles it)
+                # or timed out / refused to engage blind. Don't click.
+                time.sleep(1.0)
+                continue
             x, y = cell_to_screen(cell, cal)
+            hp_snap = state.snapshot()
             print(f"[fighter] engaging nearest mob: cell={cell} dist={d} "
-                  f"group={mob.group_id} members={mob.members} -> screen=({x},{y})")
+                  f"group={mob.group_id} members={mob.members} "
+                  f"hp~{hp_snap.estimated_life()}/{hp_snap.my_life_max} -> screen=({x},{y})")
             ctx.click(x, y)
             if wait_for(state, lambda s: s.in_fight, ENGAGE_TIMEOUT):
                 print(f"[fighter] fight_engage received (phase={state.snapshot().fight_phase})")
@@ -577,7 +878,7 @@ def main():
                   f"engage; marking ghost (total={len(ghosts)})")
             # Re-pick nearest from a *fresh* snapshot, excluding ghosts.
             fresh_snap = state.snapshot()
-            alt = nearest_mob(fresh_snap, ghosts)
+            alt = nearest_mob(fresh_snap, ghosts, args.max_group_size)
             if alt is None:
                 print(f"[fighter] no non-ghost mob groups to try; sleeping 3s")
                 time.sleep(3.0)

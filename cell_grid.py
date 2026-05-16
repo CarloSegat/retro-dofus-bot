@@ -115,7 +115,7 @@ def a_star(start, goal, blocked=()):
     range), which equals the true cost on an open grid and is therefore
     admissible — A* returns an optimal path.
 
-    Pair with `calibrate_starts.py` output:
+    Pair with `calibrate_map_cells.py` output:
 
         data = json.loads(Path("map_data/0_4.json").read_text())
         path = a_star(start_cell, goal_cell, blocked=data["obstacles"])
