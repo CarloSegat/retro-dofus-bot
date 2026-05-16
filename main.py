@@ -61,11 +61,14 @@ import time
 
 import mss
 
-from cell_grid import cell_distance, cell_to_xy, neighbors
+from cell_grid import a_star, cell_distance, cell_to_xy, neighbors
 from dialogs import ensure_safe_to_resume
 from fight import pass_turn
+from map_data import load_all as load_map_data
 from proxy_client import ProxyState
 from utils import CFG, click, make_ctx, press, press_xdotool
+
+MAP_DATA = load_map_data()  # {map_id: {"world", "map_id", "cells", "obstacles", ...}}
 
 PROXY_ADDR = "127.0.0.1:9999"
 
@@ -196,30 +199,47 @@ def alive_enemies(snap):
     return enemies
 
 
-def pick_next_step(me_cell, target_cell, snap, recent_failed):
-    """Pick the best edge-adjacent neighbor to step into this turn.
+def pick_next_step(me_cell, target_cell, snap, recent_failed, static_obstacles):
+    """Pick the next cell to step into, toward `target_cell`.
 
-    Single-cell move, not a full-MP walk: we step one tile, re-check
-    proxy state, and decide again.
+    Single-cell move, not a full-MP walk: we plan with A*, take one step,
+    re-check proxy state, and re-plan next iteration.
 
-    Filters:
-      - off-grid wraps (Po distance != 1 from me_cell)
-      - alive entity cells (dynamic obstacles -- other mobs, us)
-      - recent_failed: cells we already tried and failed *this turn*
-        (in-memory only -- no persistence, just so the loop doesn't
-        infinite-retry the same cell within a single walk_toward call)
+    Two-tier blocked set: dynamic obstacles (other live entities) are
+    transient -- they move on their own turn -- so we do NOT include
+    them in the A* plan, else one mob squatting on the optimal corridor
+    pins us in place for the whole fight. Instead we plan against the
+    static map and only veto the **immediate** next step if it would
+    walk into a live mob, falling back to a greedy neighbor pick in
+    that case.
 
-    Picks the neighbor that minimises Po distance to `target_cell`.
-    Returns None if no candidate is strictly closer than `me_cell`."""
-    occupied = {
-        e.cell for e in snap.fight_entities.values() if e.alive and e.cell > 0
+    Blocked sets:
+      - A* plan:       static_obstacles + recent_failed (minus target).
+      - Greedy fallback / next-step veto:
+                       static + dynamic (other live entities) + recent_failed.
+
+    Returns the cell to step into, or None if no walkable neighbor
+    strictly improves Po distance to `target_cell`."""
+    static = set(static_obstacles)
+    rf = set(recent_failed)
+    dynamic = {
+        e.cell for e in snap.fight_entities.values()
+        if e.alive and e.cell > 0 and e.cell != target_cell
     }
+
+    plan_blocked = (static | rf) - {target_cell}
+    path = a_star(me_cell, target_cell, blocked=plan_blocked)
+    if path and len(path) >= 2 and path[1] not in dynamic:
+        return path[1]
+
+    # Fallback: walk one tile toward target, dodging live entities. Matches
+    # the pre-A* greedy behaviour so a mid-corridor mob doesn't pin us.
     current_dist = cell_distance(me_cell, target_cell)
     cands = []
     for n in neighbors(me_cell):
         if cell_distance(n, me_cell) != 1:
             continue  # off-grid wrap
-        if n in occupied or n in recent_failed:
+        if n in static or n in dynamic or n in rf:
             continue
         d = cell_distance(n, target_cell)
         if d >= current_dist:
@@ -233,9 +253,8 @@ def pick_next_step(me_cell, target_cell, snap, recent_failed):
 
 def place_starting_cells(snap, cal):
     """Click the saved starting cells for this map (one click per cell in
-    saved order). No-op if no entry for snap.map_id."""
-    fsp = CFG.get("fight_start_positions", {}) or {}
-    entry = fsp.get(str(snap.map_id))
+    saved order). No-op if no entry for snap.map_id in MAP_DATA."""
+    entry = MAP_DATA.get(snap.map_id)
     if not entry:
         return
     cells = entry.get("cells") or []
@@ -277,7 +296,7 @@ def _wait_movement(state, before, timeout):
     )
 
 
-def walk_toward(target_cell, state, cal):
+def walk_toward(target_cell, state, cal, static_obstacles=()):
     """Step one cell at a time toward `target_cell`. Returns (me_cell, my_ap).
 
     MP tracking: the proxy only writes fight_entities[my].mp from GTM
@@ -311,9 +330,11 @@ def walk_toward(target_cell, state, cal):
         dist = cell_distance(me_cell, target_cell)
         if dist <= 1:
             break
-        step = pick_next_step(me_cell, target_cell, state.snapshot(), recent_failed)
+        step = pick_next_step(me_cell, target_cell, state.snapshot(),
+                              recent_failed, static_obstacles)
         if step is None:
-            print(f"  no walkable neighbor improves dist={dist} "
+            print(f"  no A* path to target_cell={target_cell} from "
+                  f"me_cell={me_cell} dist={dist} "
                   f"(failed_this_turn={len(recent_failed)})")
             break
 
@@ -380,6 +401,12 @@ def run_combat_sacrid(ctx, state, cal):
     my_id = state.snapshot().my_id
     last_turn_n = 0
     buff_cast = False
+    # Static obstacles are calibrated per-map and don't move; load once.
+    map_id = state.snapshot().map_id
+    static_obstacles = set((MAP_DATA.get(map_id) or {}).get("obstacles") or ())
+    if static_obstacles:
+        print(f"  loaded {len(static_obstacles)} static obstacle(s) "
+              f"for map={map_id}")
 
     while state.snapshot().in_combat:
         new_turn = wait_for_my_turn(state, my_id, last_turn_n, TURN_WAIT_TIMEOUT_SEC)
@@ -421,7 +448,7 @@ def run_combat_sacrid(ctx, state, cal):
             # consume AP -- and its AP value comes from the turn-bounded
             # GTM, which can't see our intra-turn buff cast. Keep our
             # locally-tracked my_ap instead.
-            me_cell, _ = walk_toward(target.cell, state, cal)
+            me_cell, _ = walk_toward(target.cell, state, cal, static_obstacles)
             target = state.snapshot().fight_entities.get(target.id) or target
             dist = cell_distance(me_cell, target.cell) if me_cell else 99
 

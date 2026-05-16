@@ -105,6 +105,60 @@ def neighbors(cell):
     return [cell + d for d in NEIGHBOR_DELTAS]
 
 
+def a_star(start, goal, blocked=()):
+    """Shortest cell-id path from `start` to `goal` avoiding `blocked` cells.
+
+    Returns a list of cells `[start, ..., goal]` or `None` if unreachable
+    (or if `start`/`goal` is itself blocked). Each step is one edge-adjacent
+    neighbor; off-grid wraps are filtered by requiring Po distance 1
+    between consecutive cells. The heuristic is `cell_distance` (Po
+    range), which equals the true cost on an open grid and is therefore
+    admissible — A* returns an optimal path.
+
+    Pair with `calibrate_starts.py` output:
+
+        data = json.loads(Path("map_data/0_4.json").read_text())
+        path = a_star(start_cell, goal_cell, blocked=data["obstacles"])
+    """
+    import heapq
+
+    blocked = set(blocked)
+    if start == goal:
+        return [start]
+    if start in blocked or goal in blocked:
+        return None
+
+    open_heap = [(cell_distance(start, goal), 0, start)]
+    came_from = {start: None}
+    g_score = {start: 0}
+
+    while open_heap:
+        _, g, current = heapq.heappop(open_heap)
+        if current == goal:
+            path = []
+            c = current
+            while c is not None:
+                path.append(c)
+                c = came_from[c]
+            path.reverse()
+            return path
+        if g > g_score[current]:
+            continue  # stale heap entry
+        for n in neighbors(current):
+            if n in blocked:
+                continue
+            if cell_distance(n, current) != 1:
+                continue  # off-grid wrap
+            tentative = g + 1
+            if tentative < g_score.get(n, float("inf")):
+                came_from[n] = current
+                g_score[n] = tentative
+                f = tentative + cell_distance(n, goal)
+                heapq.heappush(open_heap, (f, tentative, n))
+
+    return None
+
+
 def reachable_within(start, mp_budget, blocked=()):
     """BFS cells reachable from `start` in at most `mp_budget` steps.
 
