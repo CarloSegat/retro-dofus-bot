@@ -24,25 +24,34 @@ Loop is a tri-state mirror of the proxy's fight_phase:
       moment the bare GS arrives.
 
   fight_phase == "combat":
-    - run_combat_sacrid: per turn -- walk adjacent to the closest alive
-      enemy if needed, cast Sacrid Foot once if adjacent and AP >= cost,
-      pass turn. Terminates when phase leaves "combat" (proxy publishes
-      fight_end on the GE xp summary, or any map change).
+    - run_combat_sacrid: per turn -- self-cast Strength Punishment buff
+      once per fight on the first eligible turn, then walk adjacent to
+      the closest alive enemy if needed, cast Sacrid Foot once if
+      adjacent and AP >= cost, pass turn. Terminates when phase leaves
+      "combat" (proxy publishes fight_end on the GE xp summary, or any
+      map change).
     - On exit press Esc and confirm no dialog is left covering the game.
 
 config.json knobs (Sacrid-specific):
   sacrid_foot_hotkey   : single-char key for the Sacrid Foot spell slot
                          (e.g. "2"). REQUIRED -- script refuses to start
                          if empty.
-  sacrid_foot_ap_cost  : AP per cast. Default 4 (retro Pied du Sacri).
-  sacrid_cast_wait_sec : Sleep after the target-click so the GTM AP/HP
+  sacrid_foot_ap_cost  : AP per Foot cast. Default 4 (retro Pied du Sacri).
+  sacrid_buff_hotkey   : single-char key for the Strength Punishment
+                         self-buff slot. Default "3".
+  sacrid_buff_ap_cost  : AP per buff cast. Default 3. Used to locally
+                         decrement AP after the buff so the rest of the
+                         turn budgets correctly (GTM only updates AP at
+                         turn boundaries).
+  sacrid_cast_wait_sec : Sleep after each cast click so the GTM AP/HP
                          update can arrive over the proxy. Default 0.8.
   sacrid_walk_wait_sec : Max wait for my_cell to settle after a walk
                          click. Default 2.0.
 
-The strategy is "one cast per turn, then pass": Sacrid Foot has a 1/turn
-cap, so even with leftover AP (e.g. 6 AP - 4 cost = 2 left) we don't try
-to cast again.
+The strategy is "one Foot cast per turn, then pass": Sacrid Foot has a
+1/turn cap, so even with leftover AP (e.g. 6 AP - 4 cost = 2 left) we
+don't try to cast it again. Strength Punishment is cast once on turn 1
+(or the first turn AP >= BUFF_AP_COST allows) and never again that fight.
 
 Ctrl+C to abort. All simulated input goes through utils.click / utils.press
 (xdotool); no library calls are made from this module.
@@ -62,6 +71,10 @@ PROXY_ADDR = "127.0.0.1:9999"
 
 SPELL_HOTKEY = CFG.get("sacrid_foot_hotkey")
 FOOT_AP_COST = int(CFG.get("sacrid_foot_ap_cost", 4))
+# Châtiment Force / Strength Punishment: Sacrieur self-buff, cast once at
+# the start of each fight. Self-target -- hotkey + click own cell.
+BUFF_HOTKEY = CFG.get("sacrid_buff_hotkey", "3")
+BUFF_AP_COST = int(CFG.get("sacrid_buff_ap_cost", 3))
 CAST_WAIT_SEC = float(CFG.get("sacrid_cast_wait_sec", 0.8))
 WALK_WAIT_SEC = float(CFG.get("sacrid_walk_wait_sec", 2.0))
 WALK_STEP_WAIT_SEC = float(CFG.get("sacrid_walk_step_wait_sec", 1.0))
@@ -235,6 +248,15 @@ def cast_foot_on(target_cell, cal):
     click(x, y)
 
 
+def cast_strength_punishment(my_cell, cal):
+    """Press Strength Punishment hotkey, then click own cell (self-buff)."""
+    x, y = cell_to_screen(my_cell, cal)
+    print(f"  CAST Strength Punishment hotkey={BUFF_HOTKEY!r} self_cell={my_cell} -> ({x},{y})")
+    press(BUFF_HOTKEY)
+    time.sleep(0.4)
+    click(x, y)
+
+
 def _wait_movement(state, before, timeout):
     """True iff my_fight_cell moves away from `before` within `timeout`."""
     return wait_for(
@@ -331,17 +353,22 @@ def run_combat_sacrid(ctx, state, cal):
          rendering the new turn (highlight, AP/MP bars). Acting earlier
          risks the spell hotkey or click landing while the previous
          actor's end-of-turn animation still has input focus.
-      1. Find closest alive enemy from proxy fight_entities.
-      2. If not adjacent, mini-step toward it (1 MP per click).
-      3. If adjacent and AP >= FOOT_AP_COST, cast Foot once (hotkey +
+      1. First eligible turn only: self-cast Strength Punishment (buff)
+         once per fight, then locally decrement AP by BUFF_AP_COST so the
+         rest of the turn budgets correctly. GTM only refreshes AP at
+         turn boundaries, so we can't re-read it mid-turn.
+      2. Find closest alive enemy from proxy fight_entities.
+      3. If not adjacent, mini-step toward it (1 MP per click).
+      4. If adjacent and AP >= FOOT_AP_COST, cast Foot once (hotkey +
          target-click).
-      4. pass_turn. Returns immediately; the next iteration's step 0
+      5. pass_turn. Returns immediately; the next iteration's step 0
          re-blocks on our next GTS, so no blind sleep is needed here.
 
     Terminates when fight_phase leaves "combat" (fight_end via GE, or
     GDM map-change fallback)."""
     my_id = state.snapshot().my_id
     last_turn_n = 0
+    buff_cast = False
 
     while state.snapshot().in_combat:
         new_turn = wait_for_my_turn(state, my_id, last_turn_n, TURN_WAIT_TIMEOUT_SEC)
@@ -359,6 +386,14 @@ def run_combat_sacrid(ctx, state, cal):
         me = snap.fight_entities.get(snap.my_id)
         my_ap = me.ap if me else 0
         my_mp = me.mp if me else 0
+
+        if not buff_cast and me_cell and my_ap >= BUFF_AP_COST:
+            cast_strength_punishment(me_cell, cal)
+            time.sleep(CAST_WAIT_SEC)
+            my_ap -= BUFF_AP_COST
+            buff_cast = True
+            print(f"  buff cast; ap_left~{my_ap}")
+
         enemies = alive_enemies(snap)
         if not enemies:
             print("  no alive enemies in snapshot; passing")
@@ -371,7 +406,11 @@ def run_combat_sacrid(ctx, state, cal):
               f"my_cell={me_cell} my_ap={my_ap} my_mp={my_mp}")
 
         if dist > 1 and me_cell and my_mp > 0:
-            me_cell, my_ap = walk_toward(target.cell, state, cal)
+            # walk_toward returns (me_cell, my_ap) but walking doesn't
+            # consume AP -- and its AP value comes from the turn-bounded
+            # GTM, which can't see our intra-turn buff cast. Keep our
+            # locally-tracked my_ap instead.
+            me_cell, _ = walk_toward(target.cell, state, cal)
             target = state.snapshot().fight_entities.get(target.id) or target
             dist = cell_distance(me_cell, target.cell) if me_cell else 99
 
