@@ -1,0 +1,255 @@
+{
+  "game_area": [
+    [
+      1067,
+      74
+    ],
+    [
+      1902,
+      581
+    ]
+  ],
+  "abort_point": [
+    942,
+    765
+  ],
+  "maps": {
+    "copper": {
+      "positions": [
+        [
+          593,
+          379
+        ],
+        [
+          631,
+          369
+        ],
+        [
+          799,
+          279
+        ],
+        [
+          841,
+          260
+        ],
+        [
+          880,
+          243
+        ],
+        [
+          957,
+          244
+        ],
+        [
+          999,
+          276
+        ],
+        [
+          1198,
+          366
+        ],
+        [
+          1245,
+          393
+        ],
+        [
+          556,
+          401
+        ]
+      ]
+    },
+    "bronze": {
+      "positions": [
+        [
+          1311,
+          321
+        ],
+        [
+          1339,
+          303
+        ],
+        [
+          1368,
+          292
+        ],
+        [
+          1397,
+          278
+        ],
+        [
+          1425,
+          270
+        ],
+        [
+          1443,
+          262
+        ],
+        [
+          1460,
+          248
+        ],
+        [
+          1499,
+          219
+        ],
+        [
+          1581,
+          222
+        ],
+        [
+          1603,
+          233
+        ],
+        [
+          1628,
+          242
+        ],
+        [
+          1653,
+          254
+        ],
+        [
+          1681,
+          267
+        ],
+        [
+          1700,
+          286
+        ],
+        [
+          1740,
+          306
+        ],
+        [
+          1262,
+          348
+        ],
+        [
+          1287,
+          331
+        ]
+      ]
+    }
+  },
+  "offset": [
+    40,
+    40
+  ],
+  "region": [
+    40,
+    30
+  ],
+  "orange_rgb": [
+    232,
+    122,
+    44
+  ],
+  "tolerance": 50,
+  "min_ratio": 0.25,
+  "fight_rgb": [
+    236,
+    56,
+    41
+  ],
+  "fight_tolerance": 40,
+  "fight_min_blob_pixels": 20,
+  "fight_ready_wait_sec": 3.0,
+  "fight_turn_wait_sec": 10.0,
+  "pass_turn_hotkey": ["e"],
+  "fight_attack_wait_sec": 1.5,
+  "attack_match_threshold": 0.85,
+  "attack_search_area": [
+    [
+      1621,
+      523
+    ],
+    [
+      1883,
+      578
+    ]
+  ],
+  "bronze_placement_points": [
+    [
+      1480,
+      399
+    ],
+    [
+      1508,
+      382
+    ]
+  ],
+  "bronze_placement_wait_sec": 5.0,
+  "bronze_spell_a_point": [
+    1823,
+    658
+  ],
+  "bronze_spell_b_point": [
+    1791,
+    658
+  ],
+  "bronze_pass_turns": 3,
+  "bronze_cast_wait_sec": 0.5,
+  "sacrid_foot_hotkey": "",
+  "sacrid_foot_ap_cost": 4,
+  "sacrid_cast_wait_sec": 0.8,
+  "sacrid_walk_wait_sec": 2.0,
+  "interval_sec": 0.4,
+  "jitter_sec": 0.1,
+  "post_click_wait_sec": 0.4,
+  "collect_wait_sec": 9.5,
+  "cooldown_sec": 300,
+  "walk_points": [
+    [
+      903,
+      321
+    ],
+    [
+      1178,
+      460
+    ],
+    [
+      653,
+      523
+    ],
+    [
+      697,
+      460
+    ],
+    [
+      828,
+      352
+    ],
+    [
+      1247,
+      482
+    ],
+    [
+      283,
+      752
+    ]
+  ],
+  "walk_min_sec": 120,
+  "walk_max_sec": 180,
+  "dialog_search_area": [
+    [
+      600,
+      250
+    ],
+    [
+      1200,
+      550
+    ]
+  ],
+  "dialog_dismiss_wait_sec": 0.5,
+  "dialog_poll_sec": 1.0,
+  "dialog_check_interval_sec": 4,
+  "cell_calibration": {
+    "origin_x": 1074.4206521739134,
+    "origin_y": 90.82832618025765,
+    "cell_w": 58.03260869565217,
+    "cell_h": 30.85264663805436,
+    "residual_px": 11.497825881443848,
+    "samples": 5,
+    "fitted_at": "2026-05-15 13:54:09"
+  }
+}
