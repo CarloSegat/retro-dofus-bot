@@ -154,9 +154,8 @@
   "fight_tolerance": 40,
   "fight_min_blob_pixels": 20,
   "fight_ready_wait_sec": 3.0,
-  "fight_turn_wait_sec": 10.0,
-  "pass_turn_hotkey": ["e"],
-  "fight_attack_wait_sec": 1.5,
+  "pass_turn_hotkey": "e",
+  "turn_start_settle_sec": 1.5,
   "attack_match_threshold": 0.85,
   "attack_search_area": [
     [
@@ -193,6 +192,9 @@
   "sacrid_foot_ap_cost": 4,
   "sacrid_cast_wait_sec": 0.8,
   "sacrid_walk_wait_sec": 2.0,
+  "sacrid_walk_step_wait_sec": 2.5,
+  "sacrid_walk_max_steps": 6,
+  "sacrid_walk_step_settle_sec": 0.5,
   "interval_sec": 0.4,
   "jitter_sec": 0.1,
   "post_click_wait_sec": 0.4,

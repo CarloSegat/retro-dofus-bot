@@ -15,7 +15,9 @@ parses the **plaintext server→client** stream into a `MapState`
 (my_cell, map_id, mob groups, players, in-fight roster). The proxy fans out
 JSON events on `127.0.0.1:9999`. Python scripts read that, combine it with
 the **cell calibration** in `config.json` to convert cell ids to screen
-pixels, and drive `pyautogui`.
+pixels, and drive the game through `xdotool` (wrapped in `utils.click` /
+`utils.right_click` / `utils.press`). No simulated input ever bypasses
+those helpers.
 
 ## Entrypoints
 
@@ -48,22 +50,47 @@ grid:
 - Calibration is per-window-size; re-run `calibrate_cells.py` if you resize
   the game.
 
+## Fight state is a tri-state machine
+
+`fight_phase` (carried in every snapshot, emitted in `fight_engage` /
+`fight_start` / `fight_end` events):
+
+| Phase | Meaning |
+|-------|---------|
+| `idle` | Not in a fight. Mobs visible on the map, can engage. |
+| `placement` | Just engaged. Placement screen up, 30s placement timer running. We can ready up. |
+| `combat` | Combat actually started — turns flowing (`GTM` roster + `GTS<actor>` turn-start), spells cast. |
+
+`Snapshot.in_combat` / `in_placement` / `in_fight` (= `phase != "idle"`)
+are convenience properties on the Python side.
+
 ## Key proxy packets (parsed in `proxy/internal/proxy/state.go`)
 
-| Packet | Meaning | What we extract |
-|--------|---------|-----------------|
+| Packet | Meaning | Effect |
+|--------|---------|--------|
 | `ASK\|<id>\|<name>\|...` | Character chosen | `my_id` |
-| `GDM\|<mapId>\|...` | Map change | `map_id`; clears mobs/players/fight |
+| `GDM\|<mapId>\|...` | Map change | `map_id`; clears mobs/players/fight; force `phase=idle` |
 | `GM\|+<cell>;...;<-id>;...;-3;<gfx^lvl,...>` | Mob group spawn | `mobs[cell]` (subkind `-3` only) |
 | `GM\|+<cell>;...;<+id>;<name>;...` | Player spawn | `players[id]` |
 | `GA0;1;<actor>;<path>` | Out-of-fight move | last 2 chars of path = dofus64-encoded dest cell |
 | `GA;1;<actor>;<path>` | In-fight / mob move | same; updates `my_cell` or mob's cell |
-| `GS` or `GS\|...` | Fight start | `in_fight = true` |
-| `GA;905;...` | Fight end (explicit) | `in_fight = false` |
+| `GA;905;<myId>;` | **Fight engage** (placement starts) | `phase: idle → placement`, emits `fight_engage`. Other actors' `GA;905;` ignored. |
+| `GS` or `GS\|...` | **Combat start** (placement timer expired / everyone ready) | `phase: * → combat`, emits `fight_start` |
+| `GE<xp>;<level>;...` | **Fight end** (post-fight XP summary) | `phase: * → idle`, emits `fight_end` |
 | `GTM\|<id>;<status>;<hp>;<ap>;<mp>;<cell>;;<hp_max>\|...` | In-fight roster | `fight_entities[id]` (collapsed form `<id>;1` = dead) |
+| `GTS<actor>\|<dur_ms>\|<turn_n>` | Turn-start for `<actor>` | `turn_actor`/`turn_number`/`turn_started_at_ms`; emits `turn_start` event. Main fighter waits for `actor==my_id`, then `turn_start_settle_sec` (1.5s) before acting. `GTF<actor>`/`GTR<actor>` (turn-finish/ready) are NOT parsed — we pass-turn ourselves and don't care about mob turn boundaries. |
 
-Implicit fallback: **any `GDM` clears `in_fight`** — covers fights that end
-via teleport without a `GA;905;`.
+The placement-start burst on the wire is:
+`GA;905;<myId>;` → `GM\|--<groupId>` → `GJK2\|0\|1\|0\|<placement_ms>\|<n>` →
+`GP<teamA>\|<teamB>\|<flag>` → `GM\|+<cell>;...;-1;973;-2;<gfx^lvl>;...`
+(in-fight mob spawn) → `ILF<n>` → `GA;950;...` (initial fight actions) →
+`GM\|+<cell>;...;<myId>;<myName>;...` (me placed). The proxy only keys off
+the first packet (`GA;905;<myId>;`); the rest are sequencing detail.
+
+**Fallbacks** (for the proxy attaching mid-fight or missing a packet):
+- `GTM\|...` seen while phase != combat → promote to `combat` (GTM
+  only fires inside an active fight).
+- `GDM\|<mapId>` map change while phase != idle → force back to `idle`.
 
 ## One-time setup (Linux)
 
@@ -91,11 +118,11 @@ python3 -u main.py
 ## Config knobs (config.json)
 
 - `cell_calibration`: written by `calibrate_cells.py`. Don't hand-edit.
-- `pass_turn_hotkey`: list of pyautogui key names, default `["ctrl","e"]`.
-  **On Ubuntu/Linux Dofus reads Super, not Ctrl** → use `["winleft","e"]`.
-- `sacrid_foot_hotkey`: pyautogui key for Marx-Rockfeller's Sacrid Foot
-  slot. **Required** — `main.py` refuses to start if empty so a
-  placeholder doesn't silently miscast. Currently `"2"`.
+- `pass_turn_hotkey`: single key name (string), default `"e"`. Passed to
+  xdotool via `utils.press`.
+- `sacrid_foot_hotkey`: key for Marx-Rockfeller's Sacrid Foot slot
+  (currently `"2"`). **Required** — `main.py` refuses to start if empty so
+  a placeholder doesn't silently miscast.
 - `sacrid_foot_ap_cost`: AP per Sacrid Foot cast (default 4).
 - `sacrid_cast_wait_sec`: pause after each cast so the proxy `GTM` update
   with the new AP/HP arrives (default 0.8).
@@ -104,16 +131,23 @@ python3 -u main.py
 
 ## Things that have bitten us
 
-- **`pyautogui.moveTo` before a pynput right-click silently breaks Dofus
-  retro on X11.** Memory `feedback_right_click_pynput.md`. (Sacrid Foot
-  uses left-click target-cell, so this doesn't bite `main.py` — but
-  it's still the right pattern if a future spell needs right-click.)
+- **`pyautogui.click` and pynput's `Button.left` both silently drop
+  events in Dofus spell-aim mode.** The spell stays armed, the cursor
+  visually sits on the target, but `my_ap` doesn't decrement.
+  `xdotool click --delay 120 1` (via `utils.click`) goes through.
+  Memory `feedback_spell_click_pynput.md`. **Do not** call pyautogui or
+  pynput's Controller for input simulation from anywhere outside
+  `utils.py`.
 - **Cell formula:** `row=c//14, col=c%14` is WRONG for Dofus. Use the
   29-cells-per-pair sub-row layout above.
 - **`GS` prefix** matches multiple Dofus packets if too greedy. Match
   exactly `pkt == "GS"` or `strings.HasPrefix(pkt, "GS|")`.
-- **Stale `in_fight`**: if proxy connects mid-fight and misses `GA;905;`,
-  the flag wedges. The `GDM`-clears-`in_fight` fallback handles this on
-  next map change.
+- **`GA;905;<actorId>;` is engage, NOT fight-end.** Earlier versions of
+  the proxy treated it as fight-end, which meant `in_fight` only flipped
+  true ~30 s after a click (when `GS` arrived). The 30s gap is the
+  placement timer (`GJK2|...|30000|...`), not network latency.
+- **Stale `phase`**: if the proxy connects mid-fight and misses
+  `GA;905;`/`GS`/`GE`, a `GTM` in flight will still promote phase to
+  `combat`, and the `GDM`-clears-phase fallback handles teleport-out.
 - **Stdout buffering through `tee`**: run python with `-u` or output may
   appear to "do nothing" until the process exits.

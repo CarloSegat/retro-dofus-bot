@@ -38,19 +38,55 @@ func pathDestination(path string) (int, bool) {
 	return decodeDofus64Cell(path[len(path)-2:])
 }
 
+// FightPhase is the tri-state machine reflecting the current fight context.
+//
+//	idle      -- not in a fight. Mobs visible on the map, can engage.
+//	placement -- engage signal received (GA;905;<myId>;). Placement screen
+//	             is up, the 30s placement timer is counting. Ready-up press
+//	             advances to combat; otherwise the timer expires and combat
+//	             starts automatically.
+//	combat    -- bare GS packet seen. Turns flow (GTF/GTR/GTM), spells cast.
+//
+// Transitions and the signals that drive them:
+//
+//	idle      -> placement : GA;905;<myId>;  (the only signal worth trusting
+//	                          for "I just engaged" -- other actors' GA;905;
+//	                          packets are ignored).
+//	placement -> combat    : bare GS (or "GS|...").
+//	idle      -> combat    : GTM seen while not in combat. Fallback for the
+//	                          case where the proxy attached mid-fight and
+//	                          missed both GA;905 and GS.
+//	combat    -> idle      : GE<xp>;... XP summary at end of fight.
+//	*         -> idle      : GDM|<mapId> map change. Any teleport-out kills
+//	                          a stale fight state.
+type FightPhase string
+
+const (
+	PhaseIdle      FightPhase = "idle"
+	PhasePlacement FightPhase = "placement"
+	PhaseCombat    FightPhase = "combat"
+)
+
 // stateTracker consumes server->client packets and emits structured events
 // (state snapshots, fight transitions) to the eventHub.
 type stateTracker struct {
 	hub *eventHub
 
-	mu             sync.Mutex
-	mapID          int
-	myID           int
-	myCell         int
-	inFight        bool
-	mobs           map[int]MobGroup    // keyed by cell
-	players        map[int]Player      // keyed by player id
-	fightEntities  map[int]FightEntity // keyed by actor id (in-fight only)
+	mu            sync.Mutex
+	mapID         int
+	myID          int
+	myCell        int
+	phase         FightPhase
+	mobs          map[int]MobGroup    // keyed by cell
+	players       map[int]Player      // keyed by player id
+	fightEntities map[int]FightEntity // keyed by actor id (in-fight only)
+
+	// Turn state, driven by GTS<actorId>|<dur_ms>|<turn_n> packets.
+	// Reset on phase transitions back to idle.
+	turnActor       int   // actorId whose turn just started (0 = none)
+	turnNumber      int   // monotonically increasing turn counter within a fight
+	turnStartedAtMs int64 // proxy-side wall clock (UnixMilli) at GTS receipt
+	turnDurMs       int   // turn time allowance as quoted in the GTS packet
 }
 
 // MobGroup is one aggressive monster pack sitting on a cell.
@@ -82,6 +118,7 @@ type FightEntity struct {
 func newStateTracker(hub *eventHub) *stateTracker {
 	return &stateTracker{
 		hub:           hub,
+		phase:         PhaseIdle,
 		mobs:          make(map[int]MobGroup),
 		players:       make(map[int]Player),
 		fightEntities: make(map[int]FightEntity),
@@ -96,21 +133,22 @@ func (s *stateTracker) Apply(pkt string) {
 		s.applyGDM(pkt[4:])
 	case strings.HasPrefix(pkt, "GM|"):
 		s.applyGM(pkt[3:])
-	case pkt == "GS" || strings.HasPrefix(pkt, "GS|"):
-		// Real fight-start packet is bare "GS" (or "GS|<args>" in some
-		// flavors). Don't match "GSf", "GSU", etc.
-		log.Printf("[state] fight_start trigger pkt=%q", pkt)
-		s.setFight(true)
 	case strings.HasPrefix(pkt, "GA;905;"):
-		log.Printf("[state] fight_end trigger pkt=%q", pkt)
-		s.setFight(false)
+		// GA;905;<actorId>; -- the actor has entered a fight challenge.
+		// First packet of the placement-phase burst (immediately followed
+		// on the wire by GJK2 placement timer, GP positions, ILF, and
+		// the in-fight GM|+ spawns). For our own myID this is the
+		// idle->placement transition; we ignore other actors' GA;905;.
+		s.handleEngage(pkt[len("GA;905;"):])
+	case pkt == "GS" || strings.HasPrefix(pkt, "GS|"):
+		// Bare GS = placement timer expired (or everyone hit Ready),
+		// combat actually begins. Don't match "GSf", "GSU", etc.
+		s.setPhase(PhaseCombat, "GS combat-start")
 	case len(pkt) >= 3 && pkt[0] == 'G' && pkt[1] == 'E' && pkt[2] >= '0' && pkt[2] <= '9':
-		// GE<xp>;<level>;<count>|... is the post-fight XP summary. It
-		// always fires when a fight ends with rewards, so use it as a
-		// backup trigger if GA;905; gets lost (some flavors of retro
-		// frame it differently). setFight is idempotent.
-		log.Printf("[state] fight_end trigger (GE xp summary) pkt=%q", pkt)
-		s.setFight(false)
+		// GE<xp>;<level>;<count>|... post-fight XP summary. The
+		// authoritative fight-end signal in this server flavor -- there
+		// is no GA;<id>; for fight end.
+		s.setPhase(PhaseIdle, "GE xp summary")
 	case strings.HasPrefix(pkt, "ASK|"):
 		// ASK|<id>|<name>|<level>|... is pushed right after the player
 		// picks a character; it's our reliable source for myID.
@@ -131,6 +169,13 @@ func (s *stateTracker) Apply(pkt string) {
 		// where each entity is "<id>;<status>;<hp>;<ap>;<mp>;<cell>;<?>;<hp_max>"
 		// or just "<id>;1" if the entity died this turn.
 		s.applyGTM(pkt[4:])
+	case strings.HasPrefix(pkt, "GTS"):
+		// GTS<actorId>|<dur_ms>|<turn_n> -- turn-start for <actorId>.
+		// Fires once per actor per round. GTM arrives just *before* GTS
+		// at each turn boundary (carrying refreshed AP/MP), so by the
+		// time we see GTS the snapshot is already current. When
+		// <actorId> == myID the bot may begin acting.
+		s.applyGTS(pkt[3:])
 	}
 }
 
@@ -157,6 +202,17 @@ func (s *stateTracker) applyMovement(body string) {
 			log.Printf("[state] my_cell %d -> %d (path %q)", s.myCell, dest, parts[1])
 			s.myCell = dest
 			changed = true
+		}
+		// GTM only fires at turn boundaries, so fightEntities[myID].Cell
+		// goes stale the moment we walk. Patch it here so consumers using
+		// fight_entities (which is preferred over my_cell in-fight) see
+		// the new position immediately.
+		if s.phase == PhaseCombat {
+			if me, ok := s.fightEntities[s.myID]; ok && me.Cell != dest {
+				me.Cell = dest
+				s.fightEntities[s.myID] = me
+				changed = true
+			}
 		}
 	} else if actorID < 0 {
 		// Mob group movement. Find current cell by group_id and re-key.
@@ -202,26 +258,70 @@ func (s *stateTracker) captureMyID(body string) {
 	}
 }
 
-func (s *stateTracker) setFight(active bool) {
+// handleEngage processes the body of "GA;905;<actorId>;[<args>]". Only
+// promotes us to placement when the actor is myID -- other players'
+// engage packets are just chatter.
+func (s *stateTracker) handleEngage(body string) {
+	parts := strings.SplitN(body, ";", 2)
+	if len(parts) < 1 {
+		return
+	}
+	actorID, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return
+	}
 	s.mu.Lock()
-	changed := s.inFight != active
-	s.inFight = active
-	if !active {
-		// Leaving a fight clears the in-fight roster.
+	isMe := s.myID != 0 && actorID == s.myID
+	s.mu.Unlock()
+	if !isMe {
+		return
+	}
+	s.setPhase(PhasePlacement, "GA;905; engage")
+}
+
+// setPhase transitions to the given fight phase, publishing one of three
+// hub events on every real change:
+//
+//	idle      -> placement  ==> "fight_engage"
+//	*         -> combat     ==> "fight_start"
+//	*         -> idle       ==> "fight_end"
+//
+// Leaving a fight (any phase -> idle) clears the fight_entities roster.
+func (s *stateTracker) setPhase(phase FightPhase, reason string) {
+	s.mu.Lock()
+	if s.phase == phase {
+		s.mu.Unlock()
+		return
+	}
+	prev := s.phase
+	s.phase = phase
+	if phase == PhaseIdle {
 		s.fightEntities = make(map[int]FightEntity)
+		s.turnActor = 0
+		s.turnNumber = 0
+		s.turnStartedAtMs = 0
+		s.turnDurMs = 0
 	}
 	s.mu.Unlock()
-	if changed {
-		ev := "fight_end"
-		if active {
-			ev = "fight_start"
-		}
-		s.hub.Publish(map[string]interface{}{
-			"type": ev,
-			"ts":   time.Now().UnixMilli(),
-		})
-		s.emitSnapshot()
+	log.Printf("[state] phase %s -> %s (%s)", prev, phase, reason)
+
+	var ev string
+	switch {
+	case prev == PhaseIdle && phase == PhasePlacement:
+		ev = "fight_engage"
+	case phase == PhaseCombat:
+		ev = "fight_start"
+	case phase == PhaseIdle:
+		ev = "fight_end"
 	}
+	if ev != "" {
+		s.hub.Publish(map[string]interface{}{
+			"type":  ev,
+			"phase": string(phase),
+			"ts":    time.Now().UnixMilli(),
+		})
+	}
+	s.emitSnapshot()
 }
 
 // applyGTM parses one GTM packet body and replaces fightEntities with the
@@ -256,13 +356,64 @@ func (s *stateTracker) applyGTM(body string) {
 	}
 	s.mu.Lock()
 	s.fightEntities = entities
+	needPromote := s.phase != PhaseCombat
 	s.mu.Unlock()
+	if needPromote {
+		// GTM only fires inside combat. Seeing one while idle/placement
+		// means we missed GS (proxy attached mid-fight, or the packet
+		// boundary swallowed it). Promote ourselves now.
+		s.setPhase(PhaseCombat, "GTM seen outside combat")
+		return
+	}
 	s.emitSnapshot()
 }
 
 func atoiSafe(s string) int {
 	n, _ := strconv.Atoi(s)
 	return n
+}
+
+// applyGTS consumes the body of a "GTS<actorId>|<dur_ms>|<turn_n>" packet
+// (no leading "GTS"). Updates turn state and emits a lightweight
+// "turn_start" event with the receive-time wall clock so the bot can
+// schedule actions a fixed delay after server send.
+func (s *stateTracker) applyGTS(body string) {
+	parts := strings.Split(body, "|")
+	if len(parts) < 1 || parts[0] == "" {
+		return
+	}
+	actor, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return
+	}
+	dur := 0
+	turn := 0
+	if len(parts) >= 2 {
+		dur = atoiSafe(parts[1])
+	}
+	if len(parts) >= 3 {
+		turn = atoiSafe(parts[2])
+	}
+	nowMs := time.Now().UnixMilli()
+	s.mu.Lock()
+	myID := s.myID
+	s.turnActor = actor
+	s.turnNumber = turn
+	s.turnDurMs = dur
+	s.turnStartedAtMs = nowMs
+	s.mu.Unlock()
+	tag := "other"
+	if actor == myID && myID != 0 {
+		tag = "ME"
+	}
+	log.Printf("[state] turn_start actor=%d (%s) turn=%d dur_ms=%d", actor, tag, turn, dur)
+	s.hub.Publish(map[string]interface{}{
+		"type":   "turn_start",
+		"actor":  actor,
+		"turn":   turn,
+		"dur_ms": dur,
+		"ts":     nowMs,
+	})
 }
 
 // GDM|<mapId>|<date>|<encodedCells>
@@ -277,23 +428,24 @@ func (s *stateTracker) applyGDM(body string) {
 	}
 	s.mu.Lock()
 	changed := s.mapID != id
+	stalePhase := s.phase
 	if changed {
 		s.mapID = id
 		s.mobs = make(map[int]MobGroup)
 		s.players = make(map[int]Player)
 		s.myCell = 0
-		// A map change always means we're outside any fight. Clear
-		// stale in_fight so a missed GA;905; (e.g. fight ended via
-		// teleport, or the proxy started mid-fight and only saw GS)
-		// doesn't keep the bot wedged thinking it's still fighting.
-		if s.inFight {
-			log.Printf("[state] map change clearing stale in_fight=true")
-			s.inFight = false
-		}
 		s.fightEntities = make(map[int]FightEntity)
 	}
 	s.mu.Unlock()
 	if changed {
+		// A map change always means we're outside any fight. Force back
+		// to idle so a missed GE (fight ended via teleport, or proxy
+		// started mid-fight and never saw the XP summary) doesn't keep
+		// the bot wedged. setPhase is a no-op when already idle.
+		if stalePhase != PhaseIdle {
+			s.setPhase(PhaseIdle, "GDM map change")
+			return
+		}
 		s.emitSnapshot()
 	}
 }
@@ -408,15 +560,19 @@ func (s *stateTracker) emitSnapshot() {
 		entities = append(entities, e)
 	}
 	snap := map[string]interface{}{
-		"type":           "state",
-		"ts":             time.Now().UnixMilli(),
-		"map_id":         s.mapID,
-		"my_id":          s.myID,
-		"my_cell":        s.myCell,
-		"in_fight":       s.inFight,
-		"mobs":           mobs,
-		"players":        players,
-		"fight_entities": entities,
+		"type":               "state",
+		"ts":                 time.Now().UnixMilli(),
+		"map_id":             s.mapID,
+		"my_id":              s.myID,
+		"my_cell":            s.myCell,
+		"fight_phase":        string(s.phase),
+		"mobs":               mobs,
+		"players":            players,
+		"fight_entities":     entities,
+		"turn_actor":         s.turnActor,
+		"turn_number":        s.turnNumber,
+		"turn_started_at_ms": s.turnStartedAtMs,
+		"turn_dur_ms":        s.turnDurMs,
 	}
 	s.mu.Unlock()
 	s.hub.Publish(snap)

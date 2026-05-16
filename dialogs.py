@@ -1,9 +1,10 @@
 """Detect and click 'Ignore [player]' link in trade/challenge dialogs via OCR."""
 import time
 from pathlib import Path
-import pyautogui
 import pytesseract
 from PIL import Image
+
+from utils import press_xdotool
 
 DEBUG_DIR = Path(__file__).with_name("debug")
 DEBUG_DIR.mkdir(exist_ok=True)
@@ -99,7 +100,7 @@ def ensure_safe_to_resume(ctx, max_retries=4, wait_sec=0.4):
         if hit is None:
             return True
         print(f"[popup] attempt {attempt}/{max_retries}: '{hit}' visible -> pressing Esc")
-        pyautogui.press("esc")
+        press_xdotool("Escape")
         time.sleep(wait_sec)
     final_hit = detect_menu_keyword(ctx, tag="final")
     if final_hit is None:

@@ -78,6 +78,32 @@ def neighbors(cell):
     return [cell + d for d in NEIGHBOR_DELTAS]
 
 
+def reachable_within(start, mp_budget, blocked=()):
+    """BFS cells reachable from `start` in at most `mp_budget` steps.
+
+    Returns {cell: steps_from_start} including `start` at distance 0.
+    `blocked` cells are not entered (still allowed as neighbors during
+    expansion check, just never enqueued). Drops off-grid wraps by
+    requiring each step to be Po-distance 1 from the previous cell."""
+    blocked = set(blocked)
+    seen = {start: 0}
+    frontier = [start]
+    for step in range(1, mp_budget + 1):
+        next_frontier = []
+        for c in frontier:
+            for n in neighbors(c):
+                if n in seen or n in blocked:
+                    continue
+                if cell_distance(n, c) != 1:
+                    continue  # off-grid wrap
+                seen[n] = step
+                next_frontier.append(n)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+    return seen
+
+
 def fit_calibration(pairs):
     """Least-squares fit of (origin_x, origin_y, cell_w, cell_h) from
     (click_xy, cell_id) samples. Returns dict with the four floats and
