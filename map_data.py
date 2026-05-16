@@ -1,10 +1,7 @@
-"""Per-map calibrated data: starting cells, NSEW exits, obstacle cells.
+"""Per-map calibrated data: starting cells, NSEW exits, obstacles.
 
-Written by `calibrate_map_cells.py` to `map_data/<world_x>_<world_y>.json`.
-Read by `main.py` at startup so the bot knows where to stand at fight
-start and which cells the A* path planner should treat as unwalkable.
-
-On-disk schema (one file per map):
+Written by `calibrate_map_cells.py`, read by `main.py`. One JSON file
+per map at `map_data/<world_x>_<world_y>.json`:
 
     {
       "world":        [x, y],
@@ -15,24 +12,11 @@ On-disk schema (one file per map):
       "saved_at":     "YYYY-MM-DD HH:MM:SS"
     }
 
-Public API:
-  load_all() -> {map_id: data}
-      Scan map_data/ and return an index keyed by map_id (proxy gives
-      map_id at runtime, not world coords). Files missing `map_id` are
-      skipped.
-  build_world_index(map_data) -> {(x, y): data}
-      Re-key by world coords for neighbour lookups.
-  safe_directions(entry, by_world) -> list of directions on `entry`
-      whose target map is calibrated AND has the opposite switch cell.
+Dofus world-coord convention (per DIRECTION_WORLD_DELTA): north
+decreases y, south increases y, east increases x, west decreases x.
 
-Navigation constants:
-  DIRECTION_WORLD_DELTA  -- {direction: (dx, dy)}. Dofus convention:
-                            north decreases y, south increases y, east
-                            increases x, west decreases x.
-  OPPOSITE_DIRECTION     -- {direction: opposite_direction}.
-
-This is the manual / calibrated counterpart to `obstacles.py`'s
-runtime-learned blocked store at `~/.auto-fighter/blocked.json`.
+Manual / calibrated counterpart to `obstacles.py`'s runtime-learned
+blocked store at `~/.auto-fighter/blocked.json`.
 """
 import json
 from pathlib import Path
@@ -95,10 +79,8 @@ def target_map_id(entry, direction, by_world):
 
 
 def safe_directions(entry, by_world):
-    """Directions from `entry` whose target map is calibrated *and* has the
-    opposite switch cell calibrated (so we can return).
-
-    Skips entries without a valid world field or switch_cells dict."""
+    """Directions from `entry` whose target map is calibrated AND has
+    the opposite switch cell calibrated (= return path exists)."""
     world = entry.get("world")
     if not (isinstance(world, (list, tuple)) and len(world) == 2):
         return []

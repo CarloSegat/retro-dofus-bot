@@ -1,25 +1,10 @@
 """Client for the Go MITM proxy's JSON event stream.
 
-The proxy (proxy/cmd/proxy) publishes one JSON object per line on a TCP
-socket (default 127.0.0.1:9999). This module connects, parses the stream
-in a background thread, and maintains a thread-safe `ProxyState` snapshot
-the rest of the bot can read.
+The proxy publishes one JSON object per line on a TCP socket
+(default 127.0.0.1:9999). This module connects, parses in a background
+thread, and maintains a thread-safe `ProxyState` snapshot.
 
-Fight state is a tri-state machine (`fight_phase`):
-  "idle"      -- not in a fight (mobs visible on the map, can engage).
-  "placement" -- engaged: placement screen up, 30s placement timer running.
-  "combat"    -- combat actually started, turns flowing.
-
-The transitions are driven by these S->C signals (matched by the proxy):
-  idle      -> placement  GA;905;<myId>;     (we walked into a mob)
-  placement -> combat     bare GS / GS|...   (placement timer expired)
-  combat    -> idle       GE<xp>;...         (post-fight XP summary)
-  *         -> idle       GDM|<mapId>        (teleport/map change fallback)
-
-Convenience properties on Snapshot:
-  in_combat    -- phase == "combat"
-  in_placement -- phase == "placement"
-  in_fight     -- phase != "idle"  (either placement or combat)
+See docs/proxy_protocol.md for fight_phase transitions and packet semantics.
 
 Usage:
     state = ProxyState("127.0.0.1:9999")
@@ -65,14 +50,10 @@ class FightEntity:
 class Snapshot:
     """Immutable snapshot of proxy state. Returned by ProxyState.snapshot().
 
-    fight_phase is one of "idle", "placement", "combat" -- see module
-    docstring for the protocol signals that drive each transition.
-
-    Turn fields are driven by GTS<actorId>|<dur_ms>|<turn_n> packets. The
-    proxy fires a `turn_start` event on every GTS; turn_actor/turn_number
-    reflect the most recent one (i.e. whose turn it is *right now*).
-    turn_started_local_ts is the wall clock when the bot received the
-    event -- use it to schedule actions a fixed delay after server send."""
+    Turn fields come from GTS<actorId>|<dur_ms>|<turn_n>; turn_actor/
+    turn_number reflect whose turn it is right now.
+    turn_started_local_ts is local time.time() at receipt -- use it to
+    schedule actions a fixed delay after server send."""
     connected: bool = False
     map_id: int = 0
     my_id: int = 0
@@ -97,16 +78,12 @@ class Snapshot:
     turn_started_local_ts: float = 0.0                  # local time.time() at event
 
     def effective_regen_ms(self) -> int:
-        """Regen rate after applying sit-state.
+        """Regen rate (ms per HP) accounting for sit-state.
 
-        Empirically (Marx-Rockfeller, Dofus retro):
-          - seated:   1 HP / 1000 ms
-          - standing: 1 HP / 2000 ms
-        The server's ILS packet reports the **seated** baseline value,
-        not standing. So while sitting we use the raw rate as-is; while
-        standing we double it. Server doesn't tell us the sit state on
-        the wire -- we infer it from the fact that the bot itself sent
-        /sit (ProxyState.sitting)."""
+        Empirically on Marx-Rockfeller: seated = 1 HP / 1000 ms,
+        standing = 1 HP / 2000 ms. ILS reports the seated baseline, so
+        we double when standing. Sit-state is inferred Python-side
+        (ProxyState.sitting); server doesn't broadcast it."""
         if self.my_life_regen_ms <= 0:
             return self.my_life_regen_ms
         if self.sitting:
@@ -116,15 +93,10 @@ class Snapshot:
     def estimated_life(self) -> int:
         """Anchor HP + extrapolated regen since the anchor.
 
-        Server emits `As` once at fight end (the anchor) and `ILS<ms>`
-        once stating regen rate; no further HP packets arrive while we
-        sit. Computed here as `min(my_life + elapsed_ms/regen_ms, my_life_max)`.
-        Falls back to literal my_life when we have no rate or no anchor
-        (e.g. brand-new proxy session that hasn't seen an As yet) -- the
-        caller's "my_life_max > 0" guard still refuses to engage blind.
-
-        Uses effective_regen_ms so a seated bot gets its 2x regen reflected
-        in the estimate (server only quotes the standing rate)."""
+        Server emits `As` (anchor) and `ILS<ms>` (rate) once post-fight;
+        no further HP packets arrive while sitting, so we extrapolate.
+        Falls back to literal my_life when rate or anchor is missing --
+        the my_life_max > 0 guard upstream still refuses blind engages."""
         if self.my_life_max <= 0:
             return self.my_life
         regen = self.effective_regen_ms()
@@ -181,10 +153,8 @@ class ProxyState:
             self._thread = None
 
     def set_sitting(self, sitting: bool):
-        """Local-only sit-state flag. Set True right after the bot sends
-        /sit; cleared automatically on fight_engage (entering combat
-        forces the character to stand). Halves the effective HP regen
-        rate inside Snapshot.estimated_life()."""
+        """Local-only sit-state flag. Set True after the bot sends /sit;
+        auto-cleared on fight_engage (combat forces stand-up)."""
         with self._lock:
             self._snap.sitting = sitting
 

@@ -1,73 +1,26 @@
-"""Engage the nearest mob, then cast Sacrid Foot on it each turn.
+"""Proxy-driven Sacrieur fighter (Marx-Rockfeller / berlinthree).
 
-Character: Marx-Rockfeller (Sacrieur), berlinthree Ankama account.
+Tri-state loop mirroring the proxy's fight_phase:
+  idle      -> engage nearest valid mob, or navigate NSEW if none
+  placement -> ready up, place starting cells
+  combat    -> run_combat_sacrid (buff -> walk -> Sacrid Foot -> pass)
+
+Strategy: one Sacrid Foot per turn (it has a 1/turn cap). Strength
+Punishment self-buff is cast once per fight on the first turn where the
+nearest enemy is within sacrid_buff_max_dist (the buff only triggers on
+damage taken; pointless if mobs are too far away to hit us before it
+expires).
 
 Usage:
   python3 -u main.py [--min-hp HP] [--max-group-size N]
 
-Args:
-  --min-hp HP           Block engaging a new mob until current HP >= HP
-                        (capped at max HP). Default 100. HP is learned from
-                        the server "As" stats packet, which fires on any stat
-                        change (post-fight, level-up, pickup) -- if the proxy
-                        hasn't seen one yet, the bot refuses to engage rather
-                        than attacking blind.
-  --max-group-size N    Ignore mob groups whose member count > N. Default 0
-                        (no cap). E.g. 3 means refuse to engage groups of 4+.
+  --min-hp:         wait until HP >= this (capped at max) before engaging.
+                    If no "As" stats packet has been seen, refuse rather
+                    than attack blind.
+  --max-group-size: skip mob groups with more than N members. 0 = no cap.
 
-Pre-reqs:
-  - Go proxy running on 127.0.0.1:9999.
-  - config.json has cell_calibration.
-  - config.sacrid_foot_hotkey is set to whatever 1-9 slot the spell lives
-    in on Marx-Rockfeller's spell bar.
-
-Loop is a tri-state mirror of the proxy's fight_phase:
-
-  fight_phase == "idle":
-    - As soon as any mob group is visible, click the nearest one (Dofus
-      auto-walks into it). The proxy flips to "placement" the moment it
-      sees GA;905;<myId>; on the wire, so the wait after the click is
-      short (~5s); if it stays idle, the click missed -- fall back to a
-      random other mob group, then sleep.
-
-  fight_phase == "placement":
-    - Just entered fight. Placement screen is up, 30s placement timer is
-      counting. Pause briefly (fight_ready_wait_sec) then press the
-      pass-turn hotkey to ready up. Proxy will flip to "combat" the
-      moment the bare GS arrives.
-
-  fight_phase == "combat":
-    - run_combat_sacrid: per turn -- self-cast Strength Punishment buff
-      once per fight on the first eligible turn, then walk adjacent to
-      the closest alive enemy if needed, cast Sacrid Foot once if
-      adjacent and AP >= cost, pass turn. Terminates when phase leaves
-      "combat" (proxy publishes fight_end on the GE xp summary, or any
-      map change).
-    - On exit press Esc and confirm no dialog is left covering the game.
-
-config.json knobs (Sacrid-specific):
-  sacrid_foot_hotkey   : single-char key for the Sacrid Foot spell slot
-                         (e.g. "2"). REQUIRED -- script refuses to start
-                         if empty.
-  sacrid_foot_ap_cost  : AP per Foot cast. Default 4 (retro Pied du Sacri).
-  sacrid_buff_hotkey   : single-char key for the Strength Punishment
-                         self-buff slot. Default "3".
-  sacrid_buff_ap_cost  : AP per buff cast. Default 3. Used to locally
-                         decrement AP after the buff so the rest of the
-                         turn budgets correctly (GTM only updates AP at
-                         turn boundaries).
-  sacrid_cast_wait_sec : Sleep after each cast click so the GTM AP/HP
-                         update can arrive over the proxy. Default 0.8.
-  sacrid_walk_wait_sec : Max wait for my_cell to settle after a walk
-                         click. Default 2.0.
-
-The strategy is "one Foot cast per turn, then pass": Sacrid Foot has a
-1/turn cap, so even with leftover AP (e.g. 6 AP - 4 cost = 2 left) we
-don't try to cast it again. Strength Punishment is cast once on turn 1
-(or the first turn AP >= BUFF_AP_COST allows) and never again that fight.
-
-Ctrl+C to abort. All simulated input goes through utils.click / utils.press
-(xdotool); no library calls are made from this module.
+Pre-reqs: proxy running on 127.0.0.1:9999, config.json has
+cell_calibration + sacrid_foot_hotkey. See CLAUDE.md for config knobs.
 """
 import argparse
 import random
@@ -97,67 +50,36 @@ PROXY_ADDR = "127.0.0.1:9999"
 
 SPELL_HOTKEY = CFG.get("sacrid_foot_hotkey")
 FOOT_AP_COST = int(CFG.get("sacrid_foot_ap_cost", 4))
-# Châtiment Force / Strength Punishment: Sacrieur self-buff, cast once at
-# the start of each fight. Self-target -- hotkey + click own cell.
+# Strength Punishment self-buff: hotkey + click own cell.
 BUFF_HOTKEY = CFG.get("sacrid_buff_hotkey", "3")
 BUFF_AP_COST = int(CFG.get("sacrid_buff_ap_cost", 3))
-# Don't cast Strength Punishment if the nearest enemy is FURTHER than this
-# many cells (Po) away. Reason: the buff only triggers when we take damage,
-# and damage only starts arriving once enemies are close. If the nearest mob
-# is too far out we'll burn the buff window walking toward it and the spell
-# will expire before we ever get hit. Cast when nearest <= threshold (mobs
-# close enough we'll be in melee very soon); skip when nearest > threshold.
+# Skip buff if nearest enemy > this many Po away -- buff triggers on
+# damage taken, and would expire before they close the gap.
 BUFF_MAX_DIST = int(CFG.get("sacrid_buff_max_dist", 6))
 CAST_WAIT_SEC = float(CFG.get("sacrid_cast_wait_sec", 0.8))
 WALK_WAIT_SEC = float(CFG.get("sacrid_walk_wait_sec", 2.0))
 WALK_STEP_WAIT_SEC = float(CFG.get("sacrid_walk_step_wait_sec", 1.0))
 WALK_MAX_STEPS = int(CFG.get("sacrid_walk_max_steps", 6))
-# Pause between consecutive walk clicks. Dofus retro silently drops a
-# click issued while another walk is still animating client-side
-# (~300-500 ms per cell). Letting the previous step settle before the
-# next click was the root cause of false "obstacle" entries -- the
-# server had no problem with the destination cell, the client just
-# wasn't listening yet.
+# Dofus retro silently drops walk clicks issued mid-animation; settle
+# between steps to avoid false "obstacle" entries.
 WALK_STEP_SETTLE_SEC = float(CFG.get("sacrid_walk_step_settle_sec", 0.5))
 
-# Delay between the proxy receiving GTS<myID> (server-pushed turn-start)
-# and the bot firing its first click of the turn. Gives the Dofus client
-# time to render the new turn (highlight, AP/MP bars) so spell clicks
-# land instead of being eaten by the still-animating end-of-previous-turn.
+# Settle after GTS<myID> so the Dofus client finishes rendering the new
+# turn before our first click (else clicks get eaten by the previous
+# actor's end-of-turn animation).
 TURN_START_SETTLE_SEC = float(CFG.get("turn_start_settle_sec", 1.5))
-# Upper bound on how long we'll wait for our next GTS. One round is
-# dur_ms (29s) * number_of_actors; 90s covers reasonable mob counts plus
-# a placement-style stall.
 TURN_WAIT_TIMEOUT_SEC = float(CFG.get("turn_wait_timeout_sec", 90.0))
 
-# Time to wait for the proxy to report fight_phase != "idle" after we
-# click a mob. GA;905;<myId>; arrives within ~1s of a successful engage
-# (the character only has to walk the last tile or two before the engage
-# packet fires), so 5s is plenty -- a longer wait was masking the bug
-# where the proxy mis-classified GA;905; as fight_end.
 ENGAGE_TIMEOUT = 5.0
-# How long combat may take to begin after we ready up out of placement.
-# Placement timer caps at 30s; we expect GS within a couple seconds of
-# our ready press when no other players are involved.
 COMBAT_START_TIMEOUT = 35.0
 IDLE_POLL_SEC = 0.5
 STATUS_LOG_SEC = 5.0
-# Upper bound on how long we'll wait after clicking a switch-map cell for
-# either the proxy to report a new map_id or for us to aggro mid-walk.
-# A full map traversal is ~6-8 cells at ~0.5s per cell; 20s covers that
-# plus the GDM round-trip with margin.
 MAP_CHANGE_TIMEOUT = 20.0
-# After we find no valid mob on a map, remember it for this long before
-# being willing to walk back. Prevents ping-ponging into an empty
-# dead-end map when its only safe exit leads back to where we came from.
-# Mob group respawn in Dofus retro is several minutes; default 4 min.
+# How long a map stays marked "recently empty" after we find no valid
+# mob on it. Prevents ping-ponging into a dead-end neighbour whose only
+# safe exit leads back to us. Roughly mob respawn time.
 EMPTY_MAP_RESPAWN_SEC = float(CFG.get("empty_map_respawn_sec", 240.0))
 
-# HP-gate before engaging. The proxy only learns our HP from an "As"
-# stats packet, which fires on any stat change (post-fight XP/HP, level
-# up, kamas pickup). If we haven't seen one yet, my_life_max == 0 and
-# we REFUSE to engage rather than attacking blind -- complete any stat
-# change (e.g. finish one fight) to populate it.
 HP_WAIT_TIMEOUT = 300.0
 HP_POLL_SEC = 1.0
 HP_LOG_SEC = 10.0
@@ -218,22 +140,17 @@ def sit_for_regen(state):
 
 
 def wait_for_hp(state, min_hp):
-    """Block until we KNOW our HP and it's >= min(min_hp, my_life_max).
+    """Block until estimated HP >= min(min_hp, my_life_max). Returns False
+    on timeout or if we enter a fight mid-wait.
 
-    Returns True only when both conditions hold. Returns False if we
-    enter a fight while waiting (caller's combat branch picks up) or if
-    the timeout fires without ever seeing HP info -- in which case we
-    refuse to engage, because engaging blind is exactly the bug this
-    function prevents.
+    HP estimate = anchor (last As packet) + elapsed/regen_ms (last ILS
+    packet). Server only emits As on stat changes, so without
+    extrapolation we'd freeze at post-fight HP forever.
 
-    HP is computed via Snapshot.estimated_life(): anchor (last "As"
-    packet) + elapsed-time / regen_ms (last "ILS" packet). The server
-    only emits a fresh As at stat changes (post-fight/level/pickup),
-    so without this extrapolation we'd freeze at the post-fight HP and
-    never engage again.
-
-    Sit-once: /sit is sent the first iteration we're below threshold
-    and stays on until fight_engage stands us back up."""
+    Sit-once: /sit fires the first iteration below threshold and stays
+    on until fight_engage stands us back up. Refusing to engage when
+    my_life_max == 0 (no As ever seen) is intentional -- engaging blind
+    is the bug this function prevents."""
     deadline = time.time() + HP_WAIT_TIMEOUT
     announced = False
     last_log = 0.0
@@ -282,20 +199,16 @@ def wait_for_hp(state, min_hp):
 
 
 def nearest_mob(snap, ghosts=(), max_group_size=0):
-    """(distance, cell, mob) for the closest mob group, or None.
+    """(distance, cell, mob) for the closest valid mob group, or None.
 
-    `ghosts` is an iterable of (cell, group_id) tuples we've already tried
-    and failed to engage on the current map; entries matching any tuple
-    are skipped. The proxy fix (handleEngage now removes the engaged group
-    from s.mobs) handles the common case; ghosts catches everything else
-    (groups despawned by other players, missed GM|-, etc.).
+    `ghosts`: (cell, group_id) tuples already tried and failed on this
+    map -- skipped. Catches groups despawned by other players, missed
+    GM|-, etc; the proxy itself drops engaged groups from s.mobs.
 
-    `max_group_size`: if > 0, skip groups with more than this many members.
-    0 (default) means no cap.
+    `max_group_size > 0`: skip groups with > N members.
 
-    If `my_cell` isn't known yet (proxy just attached and we haven't walked
-    since), distances are meaningless -- return an arbitrary mob with
-    distance=-1 so the caller still engages instead of stalling forever."""
+    When my_cell is 0 (proxy just attached) we return an arbitrary mob
+    with distance=-1 so the caller still tries to engage."""
     ghost_set = set(ghosts)
     candidates = [
         (c, m) for c, m in snap.mobs.items()
@@ -333,26 +246,15 @@ def alive_enemies(snap):
 
 
 def pick_next_step(me_cell, target_cell, snap, recent_failed, static_obstacles):
-    """Pick the next cell to step into, toward `target_cell`.
+    """Pick one cell to step into toward `target_cell`. Returns None if
+    no walkable neighbour strictly improves Po distance.
 
-    Single-cell move, not a full-MP walk: we plan with A*, take one step,
-    re-check proxy state, and re-plan next iteration.
-
-    Two-tier blocked set: dynamic obstacles (other live entities) are
-    transient -- they move on their own turn -- so we do NOT include
-    them in the A* plan, else one mob squatting on the optimal corridor
-    pins us in place for the whole fight. Instead we plan against the
-    static map and only veto the **immediate** next step if it would
-    walk into a live mob, falling back to a greedy neighbor pick in
-    that case.
-
-    Blocked sets:
-      - A* plan:       static_obstacles + recent_failed (minus target).
-      - Greedy fallback / next-step veto:
-                       static + dynamic (other live entities) + recent_failed.
-
-    Returns the cell to step into, or None if no walkable neighbor
-    strictly improves Po distance to `target_cell`."""
+    Single-cell-at-a-time: plan with A*, take one step, re-check proxy
+    state, re-plan. Two-tier blocked set is the key trick -- dynamic
+    obstacles (live entities) are *not* in the A* plan (one mob squatting
+    in the optimal corridor would pin us) but we still veto the
+    immediate next step if it walks into a live mob, falling back to a
+    greedy neighbour pick."""
     static = set(static_obstacles)
     rf = set(recent_failed)
     dynamic = {
@@ -432,25 +334,15 @@ def _wait_movement(state, before, timeout):
 def walk_toward(target_cell, state, cal, static_obstacles=()):
     """Step one cell at a time toward `target_cell`. Returns (me_cell, my_ap).
 
-    MP tracking: the proxy only writes fight_entities[my].mp from GTM
-    packets, which fire at turn boundaries -- not after each mid-turn
-    walk. Reading mp from the snapshot every iteration gives the
-    turn-start value forever, so the loop has no idea when we've spent
-    all our MP. We read mp ONCE at entry and decrement locally by
-    cell_distance(before, after) per step.
+    MP is read ONCE from GTM at entry and decremented locally per step --
+    GTM only refreshes at turn boundaries, so polling mid-turn returns
+    the stale turn-start value forever.
 
-    Animation timing: Dofus retro silently drops a walk click issued
-    while another walk is still animating client-side. Sleep
-    WALK_STEP_SETTLE_SEC after each successful step before the next
-    click. On click failure, settle and retry the SAME cell once. If
-    the retry also fails, give up on that cell for the rest of this
-    turn (in-memory only -- no persistence).
+    On click failure, settle and retry the same cell once; if that also
+    fails, exclude the cell for the rest of this turn (in-memory only).
 
-    Termination:
-      - Po distance to target_cell reaches 1 (caller will cast),
-      - estimated MP reaches 0,
-      - no neighbor strictly improves Po distance,
-      - WALK_MAX_STEPS safety cap reached."""
+    Terminates when: distance to target hits 1, MP runs out, no
+    neighbour improves distance, or WALK_MAX_STEPS is reached."""
     recent_failed = set()
 
     initial = state.snapshot()
@@ -512,43 +404,16 @@ def walk_toward(target_cell, state, cal, static_obstacles=()):
 def run_combat_sacrid(ctx, state, cal):
     """Combat-phase loop. Caller guarantees fight_phase == "combat".
 
-    Per turn:
-      0. Block until proxy reports GTS<myID> (server-pushed turn-start),
-         then sleep TURN_START_SETTLE_SEC so the Dofus client has finished
-         rendering the new turn (highlight, AP/MP bars). Acting earlier
-         risks the spell hotkey or click landing while the previous
-         actor's end-of-turn animation still has input focus.
-      1. First turn the nearest enemy is <= BUFF_MAX_DIST cells away:
-         self-cast Strength Punishment (buff) once per fight, then
-         locally decrement AP by BUFF_AP_COST so the rest of the turn
-         budgets correctly. GTM only refreshes AP at turn boundaries,
-         so we can't re-read it mid-turn. If the nearest enemy is too
-         far we skip the buff -- it triggers on damage taken, and we
-         won't be taking damage until they close the gap; the buff
-         would expire before paying off.
-      2. Pick the locked target. The first turn we pick the closest alive
-         enemy and remember its id (or its starting cell if id is missing);
-         every subsequent turn we keep attacking that same target until
-         it dies, only then re-picking. Prevents flip-flopping between
-         mobs when a different one wanders closer mid-fight.
-      3. If not adjacent, mini-step toward it (1 MP per click).
-      4. If adjacent and AP >= FOOT_AP_COST, cast Foot once (hotkey +
-         target-click).
-      5. pass_turn. Returns immediately; the next iteration's step 0
-         re-blocks on our next GTS, so no blind sleep is needed here.
-
-    Terminates when fight_phase leaves "combat" (fight_end via GE, or
-    GDM map-change fallback)."""
+    Per turn: wait for GTS<myID>, settle, buff-if-eligible, walk toward
+    the *locked* target (we commit to one mob until it dies to avoid
+    flip-flopping mid-fight), cast Sacrid Foot if adjacent with AP,
+    pass. Exits when phase leaves combat (GE or GDM map-change)."""
     my_id = state.snapshot().my_id
     last_turn_n = 0
     buff_cast = False
-    # Locked target across turns. `locked_target_id` is preferred; we fall
-    # back to `locked_target_cell` only if the entity has no id (shouldn't
-    # happen with current proxy parsing, but keeps the rule "same mob until
-    # dead" robust). Reset when the target dies/disappears.
+    # Locked target: id preferred, cell as fallback for id-less entities.
     locked_target_id = 0
     locked_target_cell = 0
-    # Static obstacles are calibrated per-map and don't move; load once.
     map_id = state.snapshot().map_id
     static_obstacles = set((MAP_DATA.get(map_id) or {}).get("obstacles") or ())
     if static_obstacles:
@@ -578,12 +443,9 @@ def run_combat_sacrid(ctx, state, cal):
             pass_turn(ctx)
             continue
 
-        # Buff gating: cast Strength Punishment once per fight, but only
-        # on a turn where the nearest enemy is within BUFF_MAX_DIST. The
-        # buff only triggers when WE take damage; if all enemies are far
-        # away we'll spend the buff window walking and the spell expires
-        # before anyone hits us. Re-checked every turn until they close
-        # the gap (or never, in which case we just don't buff this fight).
+        # Buff once per fight, gated by distance: skip if nearest enemy
+        # > BUFF_MAX_DIST (buff triggers on damage taken, would expire
+        # before they close). Re-checked each turn until they're in range.
         nearest_dist = (cell_distance(me_cell, enemies[0].cell)
                         if me_cell else 99)
         if not buff_cast and me_cell and my_ap >= BUFF_AP_COST:
@@ -598,10 +460,8 @@ def run_combat_sacrid(ctx, state, cal):
                 print(f"  buff: nearest_dist={nearest_dist} > {BUFF_MAX_DIST}, "
                       f"skipping (too far -- buff would expire before we get hit)")
 
-        # Lock-on logic: re-use the previous target if it's still alive in
-        # the current snapshot. Match by id first; if id is missing/0,
-        # match by the cell we last saw it on. Only re-pick when the
-        # locked target is gone (dead or despawned).
+        # Re-use previous target if still alive (match by id, fall back
+        # to cell). Re-pick only when locked target dies/despawns.
         target = None
         if locked_target_id:
             t = snap.fight_entities.get(locked_target_id)
@@ -627,10 +487,8 @@ def run_combat_sacrid(ctx, state, cal):
               f"my_cell={me_cell} my_ap={my_ap} my_mp={my_mp} (locked)")
 
         if dist > 1 and me_cell and my_mp > 0:
-            # walk_toward returns (me_cell, my_ap) but walking doesn't
-            # consume AP -- and its AP value comes from the turn-bounded
-            # GTM, which can't see our intra-turn buff cast. Keep our
-            # locally-tracked my_ap instead.
+            # Discard walk_toward's my_ap return -- it reads GTM which
+            # can't see our intra-turn buff cast. Keep locally-tracked AP.
             me_cell, _ = walk_toward(target.cell, state, cal, static_obstacles)
             target = state.snapshot().fight_entities.get(target.id) or target
             dist = cell_distance(me_cell, target.cell) if me_cell else 99
@@ -695,24 +553,17 @@ def main():
         ctx = make_ctx(sct)
         last_status_ts = 0.0
         placed_for_engage_ts = 0.0
-        # Local "ghost" set: (cell, group_id) tuples we've clicked but
-        # failed to engage on the current map. Cleared on map_id change.
-        # The proxy preemptively drops engaged groups from s.mobs, but
-        # this catches everything that slips past (missed GM|-, other
-        # players engaging a group whose despawn we missed, etc.).
+        # (cell, group_id) tuples we clicked but failed to engage on
+        # this map. Cleared on map change. Catches anything the proxy's
+        # s.mobs-drop doesn't (missed GM|-, third-party engages, etc).
         ghosts = set()
         last_map_id = snap.map_id
-        # Direction we most recently used to leave a map via a switch
-        # cell. Used to avoid immediately walking back (we exclude the
-        # opposite direction on the next map) so the bot doesn't ping-pong
-        # between two empty maps. None until the first navigate-out.
+        # Last direction we walked out a switch cell -- used to bias
+        # away from immediate backtracking when alternatives exist.
         last_walk_direction = None
-        # {map_id: time.time() when we last found no valid mob on it}.
-        # Filtered against when picking a navigation target so we don't
-        # walk back into a map that's known empty (or all-filtered by
-        # max-group-size). Entries effectively expire after
-        # EMPTY_MAP_RESPAWN_SEC; cleared eagerly whenever we engage a
-        # mob on a map (proves it has valid mobs again).
+        # {map_id: ts when last found empty}. Filtered against when
+        # picking a navigation target; entries expire after
+        # EMPTY_MAP_RESPAWN_SEC and are cleared on successful engage.
         recently_empty_maps: dict[int, float] = {}
 
         while True:
@@ -730,10 +581,9 @@ def main():
                 print(f"[fighter] phase=combat (map={snap.map_id}) "
                       f"entities={len(ents)} enemies={len(others)}, running sacrid combat")
                 run_combat_sacrid(ctx, state, cal)
-                # End-of-fight cleanup: Enter first to dismiss any level-up
-                # popup (no-op if absent), then 1s gap so the XP-summary
-                # gets focus, then Esc to dismiss it. The 4s pre-wait lets
-                # both popups finish rendering before we send input.
+                # Enter dismisses any level-up popup, 1s gap lets the
+                # XP summary take focus, then Esc closes it. The 4s
+                # pre-wait gives both popups time to render.
                 time.sleep(4.0)
                 press_xdotool("Return")
                 time.sleep(1.0)
@@ -745,9 +595,7 @@ def main():
                 continue
 
             if snap.in_placement:
-                # Placement screen up after GA;905; engage. Ready up so we
-                # don't burn the full 30s placement timer; the proxy will
-                # flip phase to "combat" the moment bare GS arrives.
+                # Ready up so we don't burn the full 30s placement timer.
                 print(f"[fighter] phase=placement (map={snap.map_id}); readying up")
                 time.sleep(ctx.cfg["fight_ready_wait_sec"])
                 if snap.last_fight_engage_ts != placed_for_engage_ts:
@@ -763,23 +611,18 @@ def main():
             # phase == idle
             near = nearest_mob(snap, ghosts, args.max_group_size)
             if near is None:
-                # No valid mob to engage (either nothing visible, or every
-                # group is filtered out by --max-group-size). Try to walk
-                # to the next map via a calibrated NSEW switch cell.
+                # No valid mob (none visible or all filtered). Mark this
+                # map empty, then try to walk to a calibrated neighbour
+                # whose target isn't itself in cooldown.
                 entry = MAP_DATA.get(snap.map_id) or {}
                 switch_cells_map = entry.get("switch_cells") or {}
-                # Mark the current map as recently empty so we (or a
-                # neighbour) won't ping-pong straight back into it.
                 recently_empty_maps[snap.map_id] = time.time()
                 safe = safe_directions(entry, MAP_BY_WORLD) if switch_cells_map else []
                 now = time.time()
-                # Drop expired entries opportunistically so the dict
-                # doesn't grow unbounded on long sessions.
                 recently_empty_maps = {
                     mid: ts for mid, ts in recently_empty_maps.items()
                     if now - ts < EMPTY_MAP_RESPAWN_SEC
                 }
-                # Filter safe directions whose target is in cooldown.
                 fresh = [
                     d for d in safe
                     if (tmid := target_map_id(entry, d, MAP_BY_WORLD)) is None
@@ -844,14 +687,10 @@ def main():
                 time.sleep(IDLE_POLL_SEC)
                 continue
             d, cell, mob = near
-            # A valid mob exists on this map -- it's no longer "recently empty".
+            # Map has a valid mob -- clear the empty flag.
             recently_empty_maps.pop(snap.map_id, None)
-            # Re-snapshot right before clicking: mobs wander every few seconds
-            # and our `snap` is up to IDLE_POLL_SEC stale. The proxy keeps
-            # s.mobs current via GA0;1; (re-keyed by group_id) and GM|-
-            # (despawn), so we just verify the group we picked is still at
-            # the picked cell -- otherwise we'd click an empty tile and burn
-            # ENGAGE_TIMEOUT before falling back.
+            # Re-snapshot before clicking: mobs wander and `snap` is up
+            # to IDLE_POLL_SEC stale. Bail if the group moved.
             fresh = state.snapshot().mobs.get(cell)
             if fresh is None or fresh.group_id != mob.group_id:
                 print(f"[fighter] mob group={mob.group_id} moved/despawned "
