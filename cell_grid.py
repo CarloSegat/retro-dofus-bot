@@ -47,6 +47,33 @@ def cell_to_xy(cell, origin_x, origin_y, cell_w, cell_h):
     return int(round(x)), int(round(y))
 
 
+def xy_to_cell(x, y, origin_x, origin_y, cell_w, cell_h, max_sub_row=42):
+    """Inverse of cell_to_xy. Returns (cell_id, residual_px) -- the cell
+    whose center is closest to (x, y) under the given calibration. The
+    residual is Euclidean distance from the click to that cell's center;
+    > ~cell_w/2 means the click was outside any cell."""
+    sr_est = int((y - origin_y) / (cell_h / 2.0))
+    best_cell = 0
+    best_d2 = float("inf")
+    for sub_row in {sr_est - 1, sr_est, sr_est + 1}:
+        if sub_row < 0 or sub_row > max_sub_row:
+            continue
+        odd = sub_row % 2
+        offset = -cell_w / 2.0 if odd else 0.0
+        row_len = ODD_ROW_LEN if odd else EVEN_ROW_LEN
+        p_est = int((x - origin_x - offset) / cell_w)
+        for pos in {p_est - 1, p_est, p_est + 1}:
+            if pos < 0 or pos >= row_len:
+                continue
+            cell = (sub_row // 2) * CELLS_PER_PAIR + (EVEN_ROW_LEN if odd else 0) + pos
+            px, py = cell_to_xy(cell, origin_x, origin_y, cell_w, cell_h)
+            d2 = (px - x) ** 2 + (py - y) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_cell = cell
+    return best_cell, best_d2 ** 0.5
+
+
 def cell_to_uv(cell):
     """cell_id -> (u, v) iso-axis coords. +u steps SE on screen, +v steps SW.
     These are the two edge-neighbor axes: an edge-adjacent cell differs by

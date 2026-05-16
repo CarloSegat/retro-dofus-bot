@@ -208,6 +208,25 @@ def pick_next_step(me_cell, target_cell, snap, recent_failed):
     return cands[0][1]
 
 
+def place_starting_cells(snap, cal):
+    """Click the saved starting cells for this map (one click per cell in
+    saved order). No-op if no entry for snap.map_id."""
+    fsp = CFG.get("fight_start_positions", {}) or {}
+    entry = fsp.get(str(snap.map_id))
+    if not entry:
+        return
+    cells = entry.get("cells") or []
+    if not cells:
+        return
+    print(f"[fighter] placement: clicking {len(cells)} starting cell(s) "
+          f"for map={snap.map_id} world={entry.get('world')}")
+    for cell in cells:
+        x, y = cell_to_screen(cell, cal)
+        print(f"  start_click cell={cell} -> ({x},{y})")
+        click(x, y)
+        time.sleep(0.3)
+
+
 def cast_foot_on(target_cell, cal):
     """Press Sacrid Foot hotkey, then click the target cell."""
     x, y = cell_to_screen(target_cell, cal)
@@ -395,6 +414,7 @@ def main():
     with mss.mss() as sct:
         ctx = make_ctx(sct)
         last_status_ts = 0.0
+        placed_for_engage_ts = 0.0
 
         while True:
             snap = state.snapshot()
@@ -421,6 +441,9 @@ def main():
                 # flip phase to "combat" the moment bare GS arrives.
                 print(f"[fighter] phase=placement (map={snap.map_id}); readying up")
                 time.sleep(ctx.cfg["fight_ready_wait_sec"])
+                if snap.last_fight_engage_ts != placed_for_engage_ts:
+                    place_starting_cells(snap, cal)
+                    placed_for_engage_ts = snap.last_fight_engage_ts
                 pass_turn(ctx)
                 if not wait_for(state, lambda s: s.in_combat or not s.in_fight,
                                 COMBAT_START_TIMEOUT):
