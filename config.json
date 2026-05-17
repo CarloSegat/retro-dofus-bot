@@ -194,6 +194,7 @@
   "sacrid_bow_ap_cost": 4,
   "sacrid_bow_min_range": 2,
   "sacrid_bow_max_range": 6,
+  "sacrid_bow_post_walk_settle_sec": 0.33,
   "sacrid_buff_hotkey": "3",
   "sacrid_buff_ap_cost": 3,
   "sacrid_buff_max_dist": 7,

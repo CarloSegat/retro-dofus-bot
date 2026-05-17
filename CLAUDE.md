@@ -91,6 +91,11 @@ look frozen.
   Adjacent (`dist==1`) is rejected. Multi-cast per turn if AP allows.
   LoS uses `cell_grid.line_of_sight` against the same static_obstacles
   the walker avoids plus all other live entities.
+- `sacrid_bow_post_walk_settle_sec`: extra sleep ADDED to
+  `pending_settle` before the first bow shot of a turn when we
+  just walked (default 0.33). Without it the bow hotkey can be
+  dropped mid-walk-animation -- spell-aim never arms and the
+  follow-up click registers as a plain move click.
 - `sacrid_buff_hotkey` / `sacrid_buff_ap_cost` / `sacrid_buff_max_dist`
   / `sacrid_buff_cooldown_turns`: Strength Punishment self-buff slot,
   AP cost, max Po distance at which the buff is worth casting, and the

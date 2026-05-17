@@ -65,6 +65,14 @@ BOW_HOTKEY = CFG.get("sacrid_bow_hotkey", "0")
 BOW_AP_COST = int(CFG.get("sacrid_bow_ap_cost", 4))
 BOW_MIN_RANGE = int(CFG.get("sacrid_bow_min_range", 2))
 BOW_MAX_RANGE = int(CFG.get("sacrid_bow_max_range", 6))
+# Extra settle ADDED to pending_settle before the first bow shot of
+# a turn when we just walked. Empirically, the bow hotkey press was
+# dropped if it landed before the walk animation fully released --
+# the spell-aim mode never armed, and the follow-up click registered
+# as a plain move-click. Spells don't need this (Dissolution uses
+# pending_settle directly and works); the bow is the symptom that
+# pending_settle's floor is a hair too short for weapon-arming.
+BOW_POST_WALK_EXTRA_SETTLE_SEC = float(CFG.get("sacrid_bow_post_walk_settle_sec", 0.33))
 # Strength Punishment self-buff: hotkey + click own cell.
 BUFF_HOTKEY = CFG.get("sacrid_buff_hotkey", "3")
 BUFF_AP_COST = int(CFG.get("sacrid_buff_ap_cost", 3))
@@ -949,7 +957,7 @@ def run_combat_sacrid(ctx, state, cal):
                 # AND adds free damage on turns Dissolution already fired.
                 if state.snapshot().in_combat and me_cell:
                     if pending_settle > 0:
-                        time.sleep(pending_settle)
+                        time.sleep(pending_settle + BOW_POST_WALK_EXTRA_SETTLE_SEC)
                         pending_settle = 0.0
                     my_ap = fire_bow_burst(state, cal, my_ap, me_cell,
                                            static_obstacles)
@@ -1036,7 +1044,7 @@ def run_combat_sacrid(ctx, state, cal):
         # but more AP is on the table.
         if state.snapshot().in_combat and me_cell and my_ap >= BOW_AP_COST:
             if pending_settle > 0:
-                time.sleep(pending_settle)
+                time.sleep(pending_settle + BOW_POST_WALK_EXTRA_SETTLE_SEC)
                 pending_settle = 0.0
             my_ap = fire_bow_burst(state, cal, my_ap, me_cell, static_obstacles)
 
