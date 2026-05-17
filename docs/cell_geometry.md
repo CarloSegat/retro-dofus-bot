@@ -14,6 +14,11 @@ Helpers in `cell_grid.py`:
 - `cell_distance(a, b)` — Dofus "Po" range, L1 in iso (u,v) basis
 - `neighbors(cell)` — the 4 edge-adjacent cells, used by the Sacrid
   loop's walk-to-adjacent step
+- `on_map(cell)` — drops the off-map column (odd sub-row, pos 0).
+  Those positions compute to `origin_x − cell_w/2` which lands outside
+  the game window's left edge; calibrated map data confirms odd rows
+  start at pos 1, not pos 0. `a_star` / `reachable_within` /
+  `pick_next_step` use this to refuse off-window walk clicks.
 
 ## Calibration
 

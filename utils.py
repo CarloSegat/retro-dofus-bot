@@ -56,6 +56,32 @@ def right_click(x, y):
     pyautogui.rightClick()
 
 
+def spell_click(x, y):
+    """Click (x, y) via xdotool with a 120ms button-down delay,
+    targeted at the Dofus Retro window.
+
+    Use this for the second click of a spell cast (after pressing the
+    spell hotkey, when Dofus is in spell-aim mode). Empirically,
+    pyautogui's click is silently dropped in that mode -- the spell
+    stays armed, cursor on target, but `my_ap` never decrements and
+    the cast never fires. `xdotool click --delay 120 1` goes through.
+
+    We `windowactivate --sync` the Dofus window first (same workaround
+    as `press_xdotool`): under Wine, synthetic input is dropped when
+    the target window isn't focused, even when `--window` is set on
+    the xdotool command. See CLAUDE.md and memory
+    `feedback_xdotool_focus.md`."""
+    _move_mouse(x, y)
+    wid = dofus_window_id()
+    if wid:
+        subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=False)
+    args = ["xdotool", "click", "--delay", "120"]
+    if wid:
+        args += ["--window", wid]
+    args.append("1")
+    subprocess.run(args, check=True)
+
+
 def press(key, hold_sec=0.1):
     """Press a single key with a real human-length hold.
 

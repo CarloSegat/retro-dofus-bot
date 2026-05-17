@@ -29,9 +29,12 @@ Deeper references:
 
 - `main.py` — the fighter. Idle: engage nearest valid mob, navigate
   NSEW to a calibrated neighbour map when no valid mob exists.
-  Combat: walk adjacent to the locked target, cast Sacrid Foot once
-  if `ap >= sacrid_foot_ap_cost`, pass. All targeting/AP from proxy
-  GTM data, no screen detection.
+  Combat: walk toward nearest live enemy, cast Dissolution (self-cast
+  water AoE hitting the 4 edge-adjacent cells) once if anything is
+  adjacent and `ap >= sacrid_dissolution_ap_cost`, pass. No target
+  lock -- Dissolution doesn't care which mob it hits, so we re-pick
+  nearest each turn. All targeting/AP from proxy GTM data, no screen
+  detection.
 - `calibrate_map_cells.py <world_x> <world_y> [N]` — per-map calibration.
   Phase 1: click N (default 2) starting cells. Phase 2: click the
   N/E/S/W switch-map cells (press `s` to skip a direction the map
@@ -74,18 +77,35 @@ look frozen.
 
 - `cell_calibration`: pixel-to-cell transform. Don't hand-edit.
 - `pass_turn_hotkey`: single key name, default `"e"`.
-- `sacrid_foot_hotkey`: key for Sacrid Foot slot (e.g. `"2"`).
-  **Required** — `main.py` refuses to start if empty.
-- `sacrid_foot_ap_cost`: AP per Foot cast (default 4).
-- `sacrid_buff_hotkey` / `sacrid_buff_ap_cost` / `sacrid_buff_max_dist`:
-  Strength Punishment self-buff slot, cost, and the max Po distance
-  at which the buff is worth casting.
+- `sacrid_dissolution_hotkey`: key for Dissolution slot (e.g. `"2"`).
+  **Required** — `main.py` refuses to start if empty. Dissolution is a
+  self-cast water AoE: the bot presses the hotkey then clicks own cell.
+- `sacrid_dissolution_ap_cost`: AP per Dissolution cast (default 4).
+- `sacrid_buff_hotkey` / `sacrid_buff_ap_cost` / `sacrid_buff_max_dist`
+  / `sacrid_buff_cooldown_turns`: Strength Punishment self-buff slot,
+  AP cost, max Po distance at which the buff is worth casting, and the
+  in-game cooldown in turns (default 5 — bot recasts as soon as ready).
 - `sacrid_cast_wait_sec`: pause after each cast so the proxy `GTM`
   update with the new AP/HP arrives (default 0.8).
 - `sacrid_walk_wait_sec`: max wait for `my_cell` to settle after a
   walk click (default 2.0).
 - `empty_map_respawn_sec`: cooldown before the navigator will walk
   back into a map it just found empty (default 240).
+- `tofu_detect_threshold` / `tofu_detect_required_cycles`: hit-and-run
+  detector. At the START of each of our turns (before we move) we
+  sample the Po distance to the nearest alive enemy. If the last N
+  samples are all `> threshold` AND the sequence is not strictly
+  decreasing, the bot flips into "retreat" mode for the rest of the
+  fight: if MP+AP allow closing to attack range AND casting
+  Dissolution this same turn, do that first (free damage beats
+  another retreat cycle). Then walk a random 1..mp_remaining steps
+  AWAY from the nearest live enemy. Skips both the Strength
+  Punishment buff and the follow-up positioning walk. The retreat
+  breaks the kiter's rhythm
+  -- they have to spend MP closing on a moving target rather than
+  free-shooting us at max range. Sampling has to happen pre-move --
+  mid-cycle distance is polluted by our own MP spend and would
+  falsely trip the detector every fight. Defaults 4/3.
 
 ## Things that have bitten us
 

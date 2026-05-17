@@ -94,6 +94,24 @@ def cell_distance(a, b):
     return abs(ua - ub) + abs(va - vb)
 
 
+def on_map(cell):
+    """True iff `cell` is a valid playable Dofus Retro cell.
+
+    Off-map cells are those with sub_row odd AND pos == 0 -- their
+    center lands at `origin_x - cell_w/2` which is outside the game
+    window's left edge. Empirically these positions never appear in
+    calibrated map data (obstacles, switch cells, or starting cells);
+    they form a vertical column visually outside the playable map.
+    Po-distance==1 alone doesn't catch them since (cell 0, cell 14)
+    is a legitimate edge neighbour pair in (u, v) terms."""
+    if cell < 0:
+        return False
+    sub_row, pos = cell_to_subrow_pos(cell)
+    if sub_row % 2 == 1 and pos == 0:
+        return False
+    return True
+
+
 NEIGHBOR_DELTAS = (-14, 15, -15, 14)  # NE, SE, NW, SW
 
 
@@ -101,7 +119,8 @@ def neighbors(cell):
     """The 4 edge-adjacent cells of `cell` (NE, SE, NW, SW).
 
     No bounds checking — callers should drop cells whose Po distance from
-    `cell` is not 1 (which happens when the result wraps off-grid)."""
+    `cell` is not 1 (which happens when the result wraps off-grid), and
+    cells where `on_map` is False (off the playable diamond)."""
     return [cell + d for d in NEIGHBOR_DELTAS]
 
 
@@ -149,6 +168,8 @@ def a_star(start, goal, blocked=()):
                 continue
             if cell_distance(n, current) != 1:
                 continue  # off-grid wrap
+            if not on_map(n):
+                continue  # off the playable diamond
             tentative = g + 1
             if tentative < g_score.get(n, float("inf")):
                 came_from[n] = current
@@ -177,6 +198,8 @@ def reachable_within(start, mp_budget, blocked=()):
                     continue
                 if cell_distance(n, c) != 1:
                     continue  # off-grid wrap
+                if not on_map(n):
+                    continue  # off the playable diamond
                 seen[n] = step
                 next_frontier.append(n)
         if not next_frontier:
