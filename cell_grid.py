@@ -94,20 +94,37 @@ def cell_distance(a, b):
     return abs(ua - ub) + abs(va - vb)
 
 
+CANVAS_MIN_SUBROW = 1
+CANVAS_MAX_SUBROW = 31
+
+
 def on_map(cell):
     """True iff `cell` is a valid playable Dofus Retro cell.
 
-    Off-map cells are those with sub_row odd AND pos == 0 -- their
-    center lands at `origin_x - cell_w/2` which is outside the game
-    window's left edge. Empirically these positions never appear in
-    calibrated map data (obstacles, switch cells, or starting cells);
-    they form a vertical column visually outside the playable map.
-    Po-distance==1 alone doesn't catch them since (cell 0, cell 14)
-    is a legitimate edge neighbour pair in (u, v) terms."""
+    Every map shares the same fixed canvas (per-map differences are
+    obstacles, not bounds). The canvas is a screen-aligned rectangle:
+
+      - sub_row in [1, 31].  sub_row 0 (cells 0..13) sits above the
+        playable area; cells at sub_row 32+ fall below the visible
+        game window.
+      - pos==0 is off-map on every sub_row. Confirmed by clicking the
+        left edge of the diamond top-to-bottom (see
+        `calibrate_left_edge.py`): every left-edge click resolves to
+        an odd-row pos=1 cell, and the visually neighbouring even-row
+        cells are also at pos=1 -- so the entire `pos==0` column sits
+        west of the diamond. Used to keep even-row pos=0 as on-map;
+        the retreat loop kept clicking those cells and Dofus silently
+        ignored every click.
+
+    Po-distance==1 alone doesn't catch off-canvas cells since e.g.
+    (cell 0, cell 14) is a legitimate edge-neighbour pair in (u, v)
+    terms."""
     if cell < 0:
         return False
     sub_row, pos = cell_to_subrow_pos(cell)
-    if sub_row % 2 == 1 and pos == 0:
+    if sub_row < CANVAS_MIN_SUBROW or sub_row > CANVAS_MAX_SUBROW:
+        return False
+    if pos == 0:
         return False
     return True
 

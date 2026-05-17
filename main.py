@@ -69,6 +69,14 @@ BUFF_COOLDOWN_TURNS = int(CFG.get("sacrid_buff_cooldown_turns", 5))
 CAST_WAIT_SEC = float(CFG.get("sacrid_cast_wait_sec", 0.8))
 WALK_WAIT_SEC = float(CFG.get("sacrid_walk_wait_sec", 2.0))
 WALK_STEP_WAIT_SEC = float(CFG.get("sacrid_walk_step_wait_sec", 1.0))
+# Shorter per-click movement-wait for the post-Dissolution follow-up
+# walk. After an AoE cast the bot is frequently surrounded by surviving
+# mobs and the server silently rejects every walk click -- there's no
+# negative-ack to short-circuit on, only the absence of a GA;1; packet,
+# so the only lever we have is to wait less before declaring "blocked".
+# Server confirms a valid walk in <100ms; 0.6s is enough margin without
+# burning the usual 1s + retry + 0.5s settle on every dead click.
+WALK_STEP_FAST_FAIL_SEC = float(CFG.get("sacrid_walk_step_fast_fail_sec", 0.6))
 WALK_MAX_STEPS = int(CFG.get("sacrid_walk_max_steps", 6))
 # Hit-and-run detector: enemies (tofus) with high MP rush in, hit, and
 # retreat each turn. Chasing them with a 3-MP Sacrieur never closes the
@@ -436,7 +444,8 @@ def walk_away(away_from, state, cal, static_obstacles, max_steps):
         click(sx, sy)
         moved = _wait_movement(state, before, WALK_STEP_WAIT_SEC)
         if not moved:
-            print(f"    no movement; settling {WALK_STEP_SETTLE_SEC}s and retrying {step}")
+            print(f"    no movement from {before} -> cell={step} ({sx},{sy}); "
+                  f"settling {WALK_STEP_SETTLE_SEC}s and retrying")
             time.sleep(WALK_STEP_SETTLE_SEC)
             before = my_fight_cell(state.snapshot()) or before
             click(sx, sy)
@@ -450,7 +459,8 @@ def walk_away(away_from, state, cal, static_obstacles, max_steps):
             print(f"    landed {new_cell}; mp_used={mp_used} mp_left~{estimated_mp}")
             me_cell = new_cell
             continue
-        print(f"  retreat step to {step} failed twice; excluding for this turn")
+        print(f"  retreat step from {before} -> cell={step} ({sx},{sy}) "
+              f"failed twice; excluding for this turn")
         recent_failed.add(step)
 
     pending = WALK_STEP_SETTLE_SEC if moved_any else 0.0
@@ -510,7 +520,8 @@ def _wait_movement(state, before, timeout):
     )
 
 
-def try_full_walk(target_cell, state, cal, static_obstacles=(), mp_override=None):
+def try_full_walk(target_cell, state, cal, static_obstacles=(), mp_override=None,
+                  walk_wait_sec=None):
     """One-click walk that spends all current MP toward `target_cell`.
 
     Returns (success, me_cell, mp_remaining, pending_settle_sec). On
@@ -537,7 +548,13 @@ def try_full_walk(target_cell, state, cal, static_obstacles=(), mp_override=None
     `mp_override`: pass when you've already walked this turn -- the
     proxy doesn't refresh MP in fight_entities until the next GTM at
     turn start, so a state-read mid-turn returns stale MP.
+
+    `walk_wait_sec`: override the post-click movement-wait timeout.
+    Default WALK_STEP_WAIT_SEC; lower it for fast-fail walks (e.g.
+    post-Dissolution follow-up) where a missing GA;1; should be treated
+    as "blocked" sooner.
     """
+    walk_wait = walk_wait_sec if walk_wait_sec is not None else WALK_STEP_WAIT_SEC
     snap = state.snapshot()
     me = snap.fight_entities.get(snap.my_id)
     mp = mp_override if mp_override is not None else (me.mp if me else 0)
@@ -573,10 +590,10 @@ def try_full_walk(target_cell, state, cal, static_obstacles=(), mp_override=None
           f"[mp={mp} planned_steps={max_steps} target={target_cell}]")
     click(sx, sy)
 
-    moved = _wait_movement(state, me_cell, WALK_STEP_WAIT_SEC)
+    moved = _wait_movement(state, me_cell, walk_wait)
     if not moved:
-        print(f"    full walk to {dest_cell} produced no movement; "
-              f"falling back to step-by-step")
+        print(f"    full walk from {me_cell} -> cell={dest_cell} ({sx},{sy}) "
+              f"produced no movement in {walk_wait}s; falling back to step-by-step")
         return False, me_cell, mp, 0.0
 
     # Per-planned-step animation budget the caller should sleep before
@@ -597,7 +614,8 @@ def try_full_walk(target_cell, state, cal, static_obstacles=(), mp_override=None
     return True, new_cell, remaining, pending_settle
 
 
-def walk_toward(target_cell, state, cal, static_obstacles=(), mp_override=None):
+def walk_toward(target_cell, state, cal, static_obstacles=(), mp_override=None,
+                fast_fail=False):
     """Walk toward `target_cell`. Returns
     (me_cell, my_ap, mp_remaining, pending_settle_sec).
 
@@ -616,9 +634,19 @@ def walk_toward(target_cell, state, cal, static_obstacles=(), mp_override=None):
     re-emit GTM after our movement; state-read would be stale).
 
     Step-by-step fallback termination: distance hits 1, MP runs out, no
-    neighbour improves distance, or WALK_MAX_STEPS is reached."""
+    neighbour improves distance, or WALK_MAX_STEPS is reached.
+
+    `fast_fail`: when True, use WALK_STEP_FAST_FAIL_SEC as the per-click
+    movement-wait timeout and bail on the first failed step -- skipping
+    the usual single retry and the per-cell-exclusion fallback. Intended
+    for the post-Dissolution follow-up walk: the bot is often surrounded
+    by surviving mobs and the server silently rejects every walk click,
+    and spending the usual 1s + 0.5s + 1s per dead step (~2.5s) on each
+    of several cells is 5-10s of pure latency before we finally pass."""
+    walk_wait = WALK_STEP_FAST_FAIL_SEC if fast_fail else WALK_STEP_WAIT_SEC
     full_ok, new_cell, mp_remaining, pending_settle = try_full_walk(
-        target_cell, state, cal, static_obstacles, mp_override=mp_override)
+        target_cell, state, cal, static_obstacles,
+        mp_override=mp_override, walk_wait_sec=walk_wait)
     if full_ok:
         snap = state.snapshot()
         me_cell = my_fight_cell(snap) or new_cell
@@ -661,13 +689,14 @@ def walk_toward(target_cell, state, cal, static_obstacles=(), mp_override=None):
               f"({sx},{sy}) [mp_left~{estimated_mp} dist={dist}]")
         before = me_cell
         click(sx, sy)
-        moved = _wait_movement(state, before, WALK_STEP_WAIT_SEC)
-        if not moved:
-            print(f"    no movement; settling {WALK_STEP_SETTLE_SEC}s and retrying {step}")
+        moved = _wait_movement(state, before, walk_wait)
+        if not moved and not fast_fail:
+            print(f"    no movement from {before} -> cell={step} ({sx},{sy}); "
+                  f"settling {WALK_STEP_SETTLE_SEC}s and retrying")
             time.sleep(WALK_STEP_SETTLE_SEC)
             before = my_fight_cell(state.snapshot()) or before
             click(sx, sy)
-            moved = _wait_movement(state, before, WALK_STEP_WAIT_SEC)
+            moved = _wait_movement(state, before, walk_wait)
 
         steps_taken += 1
 
@@ -684,7 +713,12 @@ def walk_toward(target_cell, state, cal, static_obstacles=(), mp_override=None):
             me_cell = new_cell
             continue
 
-        print(f"  step to {step} failed twice; excluding for the rest of this turn")
+        if fast_fail:
+            print(f"  fast-fail: step from {before} -> cell={step} ({sx},{sy}) "
+                  f"didn't move in {walk_wait}s; assuming we're blocked, bailing")
+            break
+        print(f"  step from {before} -> cell={step} ({sx},{sy}) "
+              f"failed twice; excluding for the rest of this turn")
         recent_failed.add(step)
 
     snap = state.snapshot()
@@ -780,50 +814,70 @@ def run_combat_sacrid(ctx, state, cal):
             cells_to_close = max(0, dist - 1)
             can_reach = me_cell is not None and cells_to_close <= my_mp
             can_attack = my_ap >= DISSOLUTION_AP_COST
-            print(f"  [tofu] nearest id={nearest.id} cell={nearest.cell} "
-                  f"dist={dist} my_cell={me_cell} my_ap={my_ap} my_mp={my_mp}")
-            mp_remaining = my_mp
-            pending_settle = 0.0
-            if can_reach and can_attack:
-                # We CAN close and cast this turn -- do it before retreating.
-                # Free damage is always better than another retreat cycle.
-                if dist > 1:
-                    print(f"  [tofu] closing to attack (need {cells_to_close} "
-                          f"mp, have {my_mp}; ap={my_ap})")
-                    me_cell, _, mp_remaining, pending_settle = walk_toward(
-                        nearest.cell, state, cal, static_obstacles)
-                    enemies = alive_enemies(state.snapshot())
-                    dist = (cell_distance(me_cell, enemies[0].cell)
-                            if enemies and me_cell else 99)
-                if dist == 1 and my_ap >= DISSOLUTION_AP_COST:
-                    if pending_settle > 0:
-                        time.sleep(pending_settle)
+            will_attack = (dist == 1 or can_reach) and can_attack
+            # Cornered = no neighbour strictly increases dist from enemy.
+            # Combined with no attack opportunity this turn, the tofu block
+            # would just pass forever (the kiter stays out of range and we
+            # stand still until dead -- happened on cell 15 at top of
+            # diamond for 20+ turns). Fall back to normal combat: walking
+            # toward the enemy at least sets up a future cast and breaks
+            # the deadlock.
+            can_retreat = me_cell is not None and pick_retreat_step(
+                me_cell, nearest.cell, state.snapshot(),
+                set(), set(static_obstacles)) is not None
+            if not will_attack and not can_retreat:
+                print(f"  [tofu] cornered at {me_cell}: no retreat step "
+                      f"from id={nearest.id} cell={nearest.cell} dist={dist} "
+                      f"and can't close+cast (mp={my_mp} ap={my_ap}); "
+                      f"falling back to normal combat this turn")
+                # Don't `continue`; fall through to the buff + walk_toward
+                # + Dissolution block below.
+            else:
+                print(f"  [tofu] nearest id={nearest.id} cell={nearest.cell} "
+                      f"dist={dist} my_cell={me_cell} my_ap={my_ap} my_mp={my_mp}")
+                mp_remaining = my_mp
+                pending_settle = 0.0
+                if can_reach and can_attack:
+                    # We CAN close and cast this turn -- do it before retreating.
+                    # Free damage is always better than another retreat cycle.
+                    if dist > 1:
+                        print(f"  [tofu] closing to attack (need {cells_to_close} "
+                              f"mp, have {my_mp}; ap={my_ap})")
+                        me_cell, _, mp_remaining, pending_settle = walk_toward(
+                            nearest.cell, state, cal, static_obstacles)
+                        enemies = alive_enemies(state.snapshot())
+                        dist = (cell_distance(me_cell, enemies[0].cell)
+                                if enemies and me_cell else 99)
+                    if dist == 1 and my_ap >= DISSOLUTION_AP_COST:
+                        if pending_settle > 0:
+                            time.sleep(pending_settle)
+                        cast_dissolution(me_cell, cal)
+                        time.sleep(CAST_WAIT_SEC)
+                        pending_settle = 0.0
+                elif dist == 1 and can_attack:
+                    # Already adjacent (their MP ran out next to us) -- punish.
                     cast_dissolution(me_cell, cal)
                     time.sleep(CAST_WAIT_SEC)
-                    pending_settle = 0.0
-            elif dist == 1 and can_attack:
-                # Already adjacent (their MP ran out next to us) -- punish.
-                cast_dissolution(me_cell, cal)
-                time.sleep(CAST_WAIT_SEC)
-            elif dist == 1:
-                print(f"  [tofu] adjacent but ap={my_ap} < "
-                      f"{DISSOLUTION_AP_COST}; not casting")
-            # Retreat with leftover MP. Re-pick nearest in case the cast
-            # killed one and a different enemy is now closest.
-            if mp_remaining > 0 and me_cell:
-                live = alive_enemies(state.snapshot())
-                if live:
-                    anchor = live[0].cell
-                    steps = random.randint(1, mp_remaining)
-                    print(f"  [tofu] retreating {steps} step(s) away from "
-                          f"cell={anchor} (mp_left={mp_remaining})")
-                    walk_away(anchor, state, cal, static_obstacles,
-                              max_steps=steps)
-            if not state.snapshot().in_combat:
-                return
-            print("  PASS (pass-turn hotkey)")
-            pass_turn(ctx)
-            continue
+                elif dist == 1:
+                    print(f"  [tofu] adjacent but ap={my_ap} < "
+                          f"{DISSOLUTION_AP_COST}; not casting")
+                # Retreat with leftover MP. Re-pick nearest in case the cast
+                # killed one and a different enemy is now closest.
+                if mp_remaining > 0 and me_cell:
+                    live = alive_enemies(state.snapshot())
+                    if live:
+                        anchor = live[0].cell
+                        steps = random.randint(0, mp_remaining)
+                        print(f"  [tofu] retreating {steps} step(s) away from "
+                              f"cell={anchor} (mp_left={mp_remaining})")
+                        if steps > 0:
+                            walk_away(anchor, state, cal, static_obstacles,
+                                      max_steps=steps)
+                if not state.snapshot().in_combat:
+                    return
+                print("  PASS (pass-turn hotkey)")
+                pass_turn(ctx)
+                continue
 
         # Buff with cooldown: cast on turn T, recast at turn T + cooldown.
         # Distance-gated: skip if nearest enemy > BUFF_MAX_DIST (buff
@@ -882,22 +936,31 @@ def run_combat_sacrid(ctx, state, cal):
         elif dist > 1:
             print(f"  nothing adjacent (nearest_dist={dist}); not casting this turn")
 
-        # Follow-up walk: spend leftover MP closing toward the new nearest
-        # so we're better positioned next turn. Pass mp_remaining via
-        # override -- the proxy doesn't refresh GTM mid-turn so state.mp
-        # is still showing turn-start value.
+        # Follow-up walk: spend leftover MP closing toward a non-adjacent
+        # enemy so we're better positioned next turn. Pass mp_remaining
+        # via override -- the proxy doesn't refresh GTM mid-turn so
+        # state.mp is still showing turn-start value.
+        #
+        # Skip currently-adjacent enemies: GTM only fires at turn
+        # boundaries, so anything we just hit with Dissolution still
+        # shows alive=True at dist=1 until next turn. Either they died
+        # (we need to reposition) or they survived (we're still in AoE
+        # range for next turn either way) -- walking toward a more
+        # distant target wins both cases. Picking just the absolute
+        # nearest would let a stale just-killed adjacent entry block
+        # any walk and force an immediate pass.
         if state.snapshot().in_combat and mp_remaining > 0 and me_cell:
-            follow_enemies = alive_enemies(state.snapshot())
-            if follow_enemies:
-                follow = follow_enemies[0]
+            distant = [e for e in alive_enemies(state.snapshot())
+                       if cell_distance(me_cell, e.cell) > 1]
+            if distant:
+                follow = distant[0]
                 follow_dist = cell_distance(me_cell, follow.cell)
-                if follow_dist > 1:
-                    print(f"  follow-up walk: closing toward id={follow.id} "
-                          f"cell={follow.cell} dist={follow_dist} "
-                          f"mp_left={mp_remaining}")
-                    me_cell, _, mp_remaining, _ = walk_toward(
-                        follow.cell, state, cal, static_obstacles,
-                        mp_override=mp_remaining)
+                print(f"  follow-up walk: closing toward id={follow.id} "
+                      f"cell={follow.cell} dist={follow_dist} "
+                      f"mp_left={mp_remaining} (fast-fail)")
+                me_cell, _, mp_remaining, _ = walk_toward(
+                    follow.cell, state, cal, static_obstacles,
+                    mp_override=mp_remaining, fast_fail=True)
 
         if not state.snapshot().in_combat:
             return
