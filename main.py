@@ -35,7 +35,7 @@ from pathlib import Path
 
 import mss
 
-from cell_grid import a_star, cell_distance, cell_to_xy, neighbors, on_map
+from cell_grid import a_star, cell_distance, cell_to_xy, line_of_sight, neighbors, on_map
 from dialogs import ensure_safe_to_resume
 from fight import pass_turn
 from map_data import (
@@ -56,6 +56,15 @@ PROXY_ADDR = "127.0.0.1:9999"
 
 DISSOLUTION_HOTKEY = CFG.get("sacrid_dissolution_hotkey")
 DISSOLUTION_AP_COST = int(CFG.get("sacrid_dissolution_ap_cost", 4))
+# Bow weapon: press hotkey, click an enemy cell within [min, max] Po
+# range. Can NOT hit adjacent cells (min_range > 1). Same spell-aim
+# click contract as Dissolution -- xdotool spell_click, not pyautogui.
+# LoS gated against the same static_obstacles the walker uses (plus
+# live entities other than the target).
+BOW_HOTKEY = CFG.get("sacrid_bow_hotkey", "0")
+BOW_AP_COST = int(CFG.get("sacrid_bow_ap_cost", 4))
+BOW_MIN_RANGE = int(CFG.get("sacrid_bow_min_range", 2))
+BOW_MAX_RANGE = int(CFG.get("sacrid_bow_max_range", 6))
 # Strength Punishment self-buff: hotkey + click own cell.
 BUFF_HOTKEY = CFG.get("sacrid_buff_hotkey", "3")
 BUFF_AP_COST = int(CFG.get("sacrid_buff_ap_cost", 3))
@@ -511,6 +520,66 @@ def cast_strength_punishment(my_cell, cal):
     spell_click(x, y)
 
 
+def cast_bow(target_cell, cal):
+    """Press bow hotkey, then click an enemy cell. Same spell-aim click
+    contract as the Sacrieur spells -- xdotool, not pyautogui."""
+    x, y = cell_to_screen(target_cell, cal)
+    print(f"  CAST Bow hotkey={BOW_HOTKEY!r} target_cell={target_cell} -> ({x},{y})")
+    press(BOW_HOTKEY)
+    time.sleep(0.4)
+    spell_click(x, y)
+
+
+def pick_bow_target(snap, me_cell, static_obstacles):
+    """Nearest alive enemy in [BOW_MIN_RANGE, BOW_MAX_RANGE] with LoS, or None.
+
+    LoS blockers = static_obstacles (same set the walker avoids) plus
+    every other live entity. The target's own cell is excluded from
+    blockers -- you can shoot a mob standing on a square."""
+    if not me_cell:
+        return None
+    other_alive = {
+        e.cell for e in snap.fight_entities.values()
+        if e.alive and e.cell > 0 and e.id != snap.my_id
+    }
+    candidates = []
+    for e in snap.fight_entities.values():
+        if not e.alive or e.id == snap.my_id or e.cell <= 0:
+            continue
+        d = cell_distance(me_cell, e.cell)
+        if d < BOW_MIN_RANGE or d > BOW_MAX_RANGE:
+            continue
+        blockers = set(static_obstacles) | (other_alive - {e.cell})
+        if not line_of_sight(me_cell, e.cell, blockers):
+            continue
+        candidates.append((d, e))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    return candidates[0][1]
+
+
+def fire_bow_burst(state, cal, my_ap, me_cell, static_obstacles):
+    """Fire bow shots until AP < cost, no eligible target, or combat ends.
+
+    Re-pulls the snapshot before each pick so mobs killed by prior
+    shots in this burst drop out. Returns the updated AP."""
+    while my_ap >= BOW_AP_COST:
+        snap = state.snapshot()
+        if not snap.in_combat:
+            return my_ap
+        target = pick_bow_target(snap, me_cell, static_obstacles)
+        if target is None:
+            return my_ap
+        d = cell_distance(me_cell, target.cell)
+        print(f"  bow: targeting id={target.id} cell={target.cell} dist={d} "
+              f"ap_before={my_ap}")
+        cast_bow(target.cell, cal)
+        time.sleep(CAST_WAIT_SEC)
+        my_ap -= BOW_AP_COST
+    return my_ap
+
+
 def _wait_movement(state, before, timeout):
     """True iff my_fight_cell moves away from `before` within `timeout`."""
     return wait_for(
@@ -735,19 +804,24 @@ def run_combat_sacrid(ctx, state, cal):
     Per turn: wait for GTS<myID>, settle, buff-if-eligible, walk toward
     the nearest live enemy, cast Dissolution if anything is adjacent
     (re-checked after the walk -- a different mob may have closed the
-    gap), then spend any leftover MP closing distance to the new nearest
-    so we're better positioned next turn, pass. No target lock:
-    Dissolution is self-cast AoE so the "which enemy" question never
-    matters -- we just want any enemy in our 4 edge-adjacent cells.
+    gap), fire the bow at any enemy in [BOW_MIN_RANGE, BOW_MAX_RANGE]
+    Po with LoS for whatever AP remains, then spend any leftover MP
+    closing distance to the new nearest so we're better positioned
+    next turn, pass. No target lock: Dissolution is self-cast AoE so
+    the "which enemy" question never matters -- we just want any enemy
+    in our 4 edge-adjacent cells; the bow always re-picks the nearest
+    valid LoS target.
 
     Once TurnDistanceTracker flips tofu_detected (chasing is hopeless),
     switches to retreat mode: if we CAN close and cast this turn
     (cells_to_close <= my_mp AND my_ap >= DISSOLUTION_AP_COST), do
-    that first -- free damage beats another retreat cycle. Otherwise
-    (or after the cast) walk_away a random 1..mp_remaining steps from
-    the nearest live enemy. Skips buff and follow-up walk. The retreat
-    breaks the kiter's rhythm -- they have to spend MP closing on a
-    moving target instead of free-shooting us at max range.
+    that first -- free damage beats another retreat cycle. Then fire
+    bow shots until AP runs out (kiters are usually within bow range
+    after their hit-and-run move), then walk_away a random
+    1..mp_remaining steps from the nearest live enemy. Skips buff and
+    the post-Dissolution follow-up walk. The retreat breaks the
+    kiter's rhythm -- they have to spend MP closing on a moving target
+    instead of free-shooting us at max range.
 
     Exits when phase leaves combat (GE or GDM map-change)."""
     my_id = state.snapshot().my_id
@@ -825,10 +899,17 @@ def run_combat_sacrid(ctx, state, cal):
             can_retreat = me_cell is not None and pick_retreat_step(
                 me_cell, nearest.cell, state.snapshot(),
                 set(), set(static_obstacles)) is not None
-            if not will_attack and not can_retreat:
+            # A bow shot is also "an attack opportunity" -- if we can
+            # hit something at range without chasing, prefer that over
+            # falling through to normal combat (which would chase a
+            # kiter we already know we can't catch).
+            can_bow = (my_ap >= BOW_AP_COST
+                       and pick_bow_target(snap, me_cell, static_obstacles) is not None)
+            if not will_attack and not can_retreat and not can_bow:
                 print(f"  [tofu] cornered at {me_cell}: no retreat step "
                       f"from id={nearest.id} cell={nearest.cell} dist={dist} "
-                      f"and can't close+cast (mp={my_mp} ap={my_ap}); "
+                      f"and can't close+cast (mp={my_mp} ap={my_ap}) "
+                      f"and no bow target in range with LoS; "
                       f"falling back to normal combat this turn")
                 # Don't `continue`; fall through to the buff + walk_toward
                 # + Dissolution block below.
@@ -853,14 +934,25 @@ def run_combat_sacrid(ctx, state, cal):
                             time.sleep(pending_settle)
                         cast_dissolution(me_cell, cal)
                         time.sleep(CAST_WAIT_SEC)
+                        my_ap -= DISSOLUTION_AP_COST
                         pending_settle = 0.0
                 elif dist == 1 and can_attack:
                     # Already adjacent (their MP ran out next to us) -- punish.
                     cast_dissolution(me_cell, cal)
                     time.sleep(CAST_WAIT_SEC)
+                    my_ap -= DISSOLUTION_AP_COST
                 elif dist == 1:
                     print(f"  [tofu] adjacent but ap={my_ap} < "
                           f"{DISSOLUTION_AP_COST}; not casting")
+                # Bow whatever AP is left at any enemy in [min,max] Po
+                # with LoS. Picks off kiters we can't (or won't) chase
+                # AND adds free damage on turns Dissolution already fired.
+                if state.snapshot().in_combat and me_cell:
+                    if pending_settle > 0:
+                        time.sleep(pending_settle)
+                        pending_settle = 0.0
+                    my_ap = fire_bow_burst(state, cal, my_ap, me_cell,
+                                           static_obstacles)
                 # Retreat with leftover MP. Re-pick nearest in case the cast
                 # killed one and a different enemy is now closest.
                 if mp_remaining > 0 and me_cell:
@@ -928,13 +1020,25 @@ def run_combat_sacrid(ctx, state, cal):
             # spell clicks get silently dropped.
             if pending_settle > 0:
                 time.sleep(pending_settle)
+                pending_settle = 0.0
             cast_dissolution(me_cell, cal)
             time.sleep(CAST_WAIT_SEC)
+            my_ap -= DISSOLUTION_AP_COST
         elif dist == 1 and my_ap < DISSOLUTION_AP_COST:
             print(f"  adjacent but ap={my_ap} < cost={DISSOLUTION_AP_COST}; "
                   f"not casting this turn")
         elif dist > 1:
             print(f"  nothing adjacent (nearest_dist={dist}); not casting this turn")
+
+        # Bow with leftover AP. Hits anything at range [min,max] with
+        # LoS -- the fallback when we couldn't (or didn't) reach
+        # adjacency, plus a bonus hit when Dissolution already fired
+        # but more AP is on the table.
+        if state.snapshot().in_combat and me_cell and my_ap >= BOW_AP_COST:
+            if pending_settle > 0:
+                time.sleep(pending_settle)
+                pending_settle = 0.0
+            my_ap = fire_bow_burst(state, cal, my_ap, me_cell, static_obstacles)
 
         # Follow-up walk: spend leftover MP closing toward a non-adjacent
         # enemy so we're better positioned next turn. Pass mp_remaining

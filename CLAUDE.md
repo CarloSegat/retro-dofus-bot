@@ -81,6 +81,16 @@ look frozen.
   **Required** — `main.py` refuses to start if empty. Dissolution is a
   self-cast water AoE: the bot presses the hotkey then clicks own cell.
 - `sacrid_dissolution_ap_cost`: AP per Dissolution cast (default 4).
+- `sacrid_bow_hotkey`: bow-weapon slot, default `"0"`. Same
+  press-then-click contract as Dissolution. The bow is the ranged
+  fallback when Dissolution can't fire (target not adjacent and not
+  reachable this turn) and the leftover-AP burn when Dissolution
+  already fired.
+- `sacrid_bow_ap_cost` / `sacrid_bow_min_range` / `sacrid_bow_max_range`:
+  AP per shot (default 4) and the Po-distance window (default 2..6).
+  Adjacent (`dist==1`) is rejected. Multi-cast per turn if AP allows.
+  LoS uses `cell_grid.line_of_sight` against the same static_obstacles
+  the walker avoids plus all other live entities.
 - `sacrid_buff_hotkey` / `sacrid_buff_ap_cost` / `sacrid_buff_max_dist`
   / `sacrid_buff_cooldown_turns`: Strength Punishment self-buff slot,
   AP cost, max Po distance at which the buff is worth casting, and the

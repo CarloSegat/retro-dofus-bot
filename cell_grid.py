@@ -94,6 +94,60 @@ def cell_distance(a, b):
     return abs(ua - ub) + abs(va - vb)
 
 
+def uv_to_cell(u, v):
+    """Inverse of cell_to_uv. Returns cell_id, or -1 if (u, v) is off-grid.
+
+    sub_row = u + v; odd = sub_row % 2; pos = (u - v + odd) / 2.
+    Off-grid checks: sub_row < 0, pos < 0, pos >= row_len."""
+    sub_row = u + v
+    if sub_row < 0:
+        return -1
+    odd = sub_row % 2
+    pos = (u - v + odd) // 2
+    if odd:
+        if pos < 0 or pos >= ODD_ROW_LEN:
+            return -1
+        return (sub_row // 2) * CELLS_PER_PAIR + EVEN_ROW_LEN + pos
+    if pos < 0 or pos >= EVEN_ROW_LEN:
+        return -1
+    return (sub_row // 2) * CELLS_PER_PAIR + pos
+
+
+def line_of_sight(start, end, blockers):
+    """True iff no cell in `blockers` sits on the (u, v) line between
+    start and end. Used as a heuristic for ranged-attack LoS: walk the
+    diagonal in iso (u, v) coords, sub-sampling 4 points per Po unit,
+    snap each to the nearest integer cell, check against blockers.
+
+    Endpoints (start and end) are never treated as blockers -- the
+    caller is responsible for excluding the shooter and (usually) the
+    target from `blockers`. This approximation may diverge from Dofus's
+    own pixel-precise LoS at very oblique angles, but the bow's 6-cell
+    range gives little room for error and the worst case is a wasted
+    AP if a borderline shot fires through a blocker."""
+    if start == end:
+        return True
+    ua, va = cell_to_uv(start)
+    ub, vb = cell_to_uv(end)
+    du = ub - ua
+    dv = vb - va
+    span = max(abs(du), abs(dv), abs(du) + abs(dv))
+    samples = max(span * 4, 8)
+    blocked = set(blockers)
+    seen = set()
+    for t in range(1, samples):
+        f = t / samples
+        u_i = round(ua + f * du)
+        v_i = round(va + f * dv)
+        cell = uv_to_cell(u_i, v_i)
+        if cell < 0 or cell == start or cell == end or cell in seen:
+            continue
+        seen.add(cell)
+        if cell in blocked:
+            return False
+    return True
+
+
 CANVAS_MIN_SUBROW = 1
 CANVAS_MAX_SUBROW = 31
 
