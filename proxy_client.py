@@ -84,17 +84,15 @@ class Snapshot:
     turn_started_local_ts: float = 0.0                  # local time.time() at event
 
     def effective_regen_ms(self) -> int:
-        """Regen rate (ms per HP) accounting for sit-state.
+        """Regen rate (ms per HP). Server-authoritative.
 
-        Empirically on Marx-Rockfeller: seated = 1 HP / 1000 ms,
-        standing = 1 HP / 2000 ms. ILS reports the seated baseline, so
-        we double when standing. Sit-state is inferred Python-side
-        (ProxyState.sitting); server doesn't broadcast it."""
-        if self.my_life_regen_ms <= 0:
-            return self.my_life_regen_ms
-        if self.sitting:
-            return self.my_life_regen_ms
-        return self.my_life_regen_ms * 2
+        Dofus retro emits a fresh ILS packet on every sit/stand
+        transition with the correct rate for the new state
+        (ILS1000 seated, ILS2000 standing on Marx-Rockfeller). Trust it
+        verbatim -- do NOT scale by ProxyState.sitting. The proxy
+        rebases the HP anchor on rate change so extrapolation stays
+        accurate across sit<->stand transitions."""
+        return self.my_life_regen_ms
 
     def estimated_life(self) -> int:
         """Anchor HP + extrapolated regen since the anchor.

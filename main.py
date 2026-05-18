@@ -29,6 +29,7 @@ knobs.
 import json
 import random
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -239,6 +240,34 @@ class TurnDistanceTracker:
             if all_high and not strictly_decreasing:
                 self.tofu_detected = True
         return dist
+
+
+def make_exchange_dismiss_callback():
+    """Returns a proxy on_event callback that schedules an Esc 1s after
+    any exchange_open event.
+
+    The bot sometimes click-engages a mob whose cell coincides with (or
+    is masked by) a player in merchant mode -- the click registers as
+    "open shop" instead of "engage", and the shop window blocks every
+    follow-up action until dismissed. We can't tell from the click
+    alone whether the shop opened, but the proxy sees ECK<kind>|<id>
+    on the wire. 1 second is enough for the shop UI to fully render
+    before Esc reaches it. Esc is sent via xdotool to the Dofus window,
+    not pyautogui, so EscStop's pynput listener won't see it (XSendEvent
+    sets send_event; pynput filters those)."""
+    def cb(ev):
+        if ev.get("type") != "exchange_open":
+            return
+        kind = ev.get("kind")
+        target = ev.get("target")
+        def fire():
+            print(f"[fighter] exchange_open (kind={kind} target={target}) -> Esc")
+            try:
+                press_xdotool("Escape")
+            except Exception as e:
+                print(f"[fighter] exchange Esc failed: {e}")
+        threading.Timer(1.0, fire).start()
+    return cb
 
 
 def sit_for_regen(state):
@@ -603,30 +632,56 @@ def cast_bow(target_cell, cal):
     spell_click(x, y)
 
 
-def pick_bow_target(snap, me_cell, static_obstacles):
+def pick_bow_target(snap, me_cell, static_obstacles, debug=False):
     """Nearest alive enemy in [BOW_MIN_RANGE, BOW_MAX_RANGE] with LoS, or None.
 
     LoS blockers = static_obstacles (same set the walker avoids) plus
     every other live entity. The target's own cell is excluded from
-    blockers -- you can shoot a mob standing on a square."""
+    blockers -- you can shoot a mob standing on a square.
+
+    When `debug=True` and no candidate is found, prints one line per
+    rejected enemy explaining why (out-of-range / LoS blocked) so the
+    "bow silently did nothing" case is diagnosable from the trace."""
     if not me_cell:
+        if debug:
+            print("  bow: no target -- me_cell unknown")
         return None
     other_alive = {
         e.cell for e in snap.fight_entities.values()
         if e.alive and e.cell > 0 and e.id != snap.my_id
     }
     candidates = []
+    rejections = []
     for e in snap.fight_entities.values():
         if not e.alive or e.id == snap.my_id or e.cell <= 0:
             continue
         d = cell_distance(me_cell, e.cell)
         if d < BOW_MIN_RANGE or d > BOW_MAX_RANGE:
+            if debug:
+                rejections.append(
+                    f"id={e.id} cell={e.cell} out-of-range(dist={d}, "
+                    f"need {BOW_MIN_RANGE}..{BOW_MAX_RANGE})"
+                )
             continue
         blockers = set(static_obstacles) | (other_alive - {e.cell})
         if not line_of_sight(me_cell, e.cell, blockers):
+            if debug:
+                mob_blockers = sorted(other_alive - {e.cell})
+                rejections.append(
+                    f"id={e.id} cell={e.cell} dist={d} LoS-blocked "
+                    f"(other_alive={mob_blockers}, "
+                    f"static_obstacles={len(static_obstacles)})"
+                )
             continue
         candidates.append((d, e))
     if not candidates:
+        if debug:
+            if rejections:
+                print(f"  bow: no target -- {len(rejections)} enemies considered:")
+                for r in rejections:
+                    print(f"    rejected {r}")
+            else:
+                print("  bow: no target -- no alive enemies on the field")
         return None
     candidates.sort(key=lambda t: t[0])
     return candidates[0][1]
@@ -636,21 +691,27 @@ def fire_bow_burst(state, cal, my_ap, me_cell, static_obstacles):
     """Fire bow shots until AP < cost, no eligible target, or combat ends.
 
     Re-pulls the snapshot before each pick so mobs killed by prior
-    shots in this burst drop out. Returns the updated AP."""
+    shots in this burst drop out. Returns (updated_ap, shots_fired)."""
+    shots = 0
     while my_ap >= BOW_AP_COST:
         snap = state.snapshot()
         if not snap.in_combat:
-            return my_ap
-        target = pick_bow_target(snap, me_cell, static_obstacles)
+            return my_ap, shots
+        # debug=True only on the first iteration -- after a successful
+        # shot the candidate disappears as expected (mob died or AP ran
+        # out), no need to spam rejections every burst.
+        target = pick_bow_target(snap, me_cell, static_obstacles,
+                                 debug=(shots == 0))
         if target is None:
-            return my_ap
+            return my_ap, shots
         d = cell_distance(me_cell, target.cell)
         print(f"  bow: targeting id={target.id} cell={target.cell} dist={d} "
               f"ap_before={my_ap}")
         cast_bow(target.cell, cal)
         time.sleep(CAST_WAIT_SEC)
         my_ap -= BOW_AP_COST
-    return my_ap
+        shots += 1
+    return my_ap, shots
 
 
 def _wait_movement(state, before, timeout):
@@ -1004,17 +1065,21 @@ def run_combat_sacrid(ctx, state, cal):
             # kiter we already know we can't catch).
             can_bow = (my_ap >= BOW_AP_COST
                        and pick_bow_target(snap, me_cell, static_obstacles) is not None)
-            # Walking a few cells into bow range is fine even in tofu mode --
-            # one shot + retreat with leftover MP beats passing while the
-            # kiter free-shoots us at max range. Only fires when bow already
-            # can't hit from here (otherwise just shoot, save the MP).
-            steps_into_bow = (dist - BOW_MAX_RANGE
-                              if me_cell is not None and dist > BOW_MAX_RANGE
+            # Close as much as possible before shooting -- land at
+            # BOW_MIN_RANGE (or as close as MP allows, never below MIN
+            # since bow can't fire adjacent and dist=1 is the
+            # Dissolution branch above). Trades retreat MP for a tighter
+            # shot, which the user prefers: free damage from close range
+            # beats kiting at max range. Guard with `landing_dist <=
+            # BOW_MAX_RANGE` so we don't burn retreat MP closing when
+            # we still can't shoot afterwards (e.g. dist=10, mp=3).
+            steps_into_bow = (min(my_mp, dist - BOW_MIN_RANGE)
+                              if me_cell is not None and dist > BOW_MIN_RANGE
                               else 0)
-            can_walk_to_bow = (not can_bow
-                               and my_ap >= BOW_AP_COST
+            landing_dist = dist - steps_into_bow if steps_into_bow > 0 else dist
+            can_walk_to_bow = (my_ap >= BOW_AP_COST
                                and steps_into_bow > 0
-                               and steps_into_bow <= my_mp
+                               and landing_dist <= BOW_MAX_RANGE
                                and not (can_reach and can_attack))
             if not will_attack and not can_retreat and not can_bow and not can_walk_to_bow:
                 print(f"  [tofu] cornered at {me_cell}: no retreat step "
@@ -1048,12 +1113,15 @@ def run_combat_sacrid(ctx, state, cal):
                         my_ap -= DISSOLUTION_AP_COST
                         pending_settle = 0.0
                 elif can_walk_to_bow:
-                    # Can't close+cast melee, but walking `steps_into_bow`
-                    # cells puts nearest into bow range. Cap mp_override so
-                    # walk_toward stops at the bow-range edge instead of
-                    # closing to melee -- saves MP for the retreat below.
-                    print(f"  [tofu] walking {steps_into_bow} step(s) into "
-                          f"bow range (dist={dist}, bow_max={BOW_MAX_RANGE}, "
+                    # Walk as close as we can while staying at >=
+                    # BOW_MIN_RANGE (bow can't fire adjacent). Cap
+                    # mp_override at steps_into_bow so walk_toward
+                    # stops one short of melee. After this, fire_bow_burst
+                    # below shoots, then any leftover MP retreats.
+                    expected_landing = dist - steps_into_bow
+                    print(f"  [tofu] closing {steps_into_bow} step(s) toward "
+                          f"bow range (dist={dist} -> ~{expected_landing}, "
+                          f"bow_range={BOW_MIN_RANGE}..{BOW_MAX_RANGE}, "
                           f"mp={my_mp}, ap={my_ap})")
                     before_cell = me_cell
                     me_cell, _, _, pending_settle = walk_toward(
@@ -1073,12 +1141,20 @@ def run_combat_sacrid(ctx, state, cal):
                 # Bow whatever AP is left at any enemy in [min,max] Po
                 # with LoS. Picks off kiters we can't (or won't) chase
                 # AND adds free damage on turns Dissolution already fired.
+                # A successful shot clears tofu_detected: if we can hit
+                # them at range, the kiting pattern is no longer blocking
+                # us and the next turn should resume normal combat.
                 if state.snapshot().in_combat and me_cell:
                     if pending_settle > 0:
                         time.sleep(pending_settle + BOW_POST_WALK_EXTRA_SETTLE_SEC)
                         pending_settle = 0.0
-                    my_ap = fire_bow_burst(state, cal, my_ap, me_cell,
-                                           static_obstacles)
+                    my_ap, bow_shots = fire_bow_burst(
+                        state, cal, my_ap, me_cell, static_obstacles)
+                    if bow_shots > 0 and dist_tracker.tofu_detected:
+                        print(f"  [tofu] bow connected ({bow_shots} shot(s)); "
+                              f"exiting retreat mode -- we can hit them at "
+                              f"range, no need to keep kiting back")
+                        dist_tracker.tofu_detected = False
                 # Retreat with leftover MP. Re-pick nearest in case the cast
                 # killed one and a different enemy is now closest.
                 if mp_remaining > 0 and me_cell:
@@ -1161,12 +1237,20 @@ def run_combat_sacrid(ctx, state, cal):
         # Bow with leftover AP. Hits anything at range [min,max] with
         # LoS -- the fallback when we couldn't (or didn't) reach
         # adjacency, plus a bonus hit when Dissolution already fired
-        # but more AP is on the table.
+        # but more AP is on the table. Reachable from tofu mode via the
+        # cornered fall-through (line above the tofu else): if bow lands
+        # here, clear tofu_detected for the same reason as in the tofu
+        # branch -- ranged damage means the kiting is no longer a wall.
         if state.snapshot().in_combat and me_cell and my_ap >= BOW_AP_COST:
             if pending_settle > 0:
                 time.sleep(pending_settle + BOW_POST_WALK_EXTRA_SETTLE_SEC)
                 pending_settle = 0.0
-            my_ap = fire_bow_burst(state, cal, my_ap, me_cell, static_obstacles)
+            my_ap, bow_shots = fire_bow_burst(
+                state, cal, my_ap, me_cell, static_obstacles)
+            if bow_shots > 0 and dist_tracker.tofu_detected:
+                print(f"  [tofu] bow connected ({bow_shots} shot(s)) from "
+                      f"normal-combat fall-through; exiting retreat mode")
+                dist_tracker.tofu_detected = False
 
         # Follow-up walk: spend leftover MP closing toward a non-adjacent
         # enemy so we're better positioned next turn. Pass mp_remaining
@@ -1269,6 +1353,7 @@ def main():
           f"{with_safe} have >= 1 return-safe neighbour")
 
     state = ProxyState(PROXY_ADDR)
+    state.on_event(make_exchange_dismiss_callback())
     state.start()
     print(f"[fighter] connecting to proxy at {PROXY_ADDR}...")
     if not wait_for(state, lambda s: s.connected and s.my_id != 0, 10.0):
@@ -1312,6 +1397,17 @@ def main():
                 ghosts.clear()
                 last_map_id = snap.map_id
                 consecutive_walk_failures = 0
+                # GDM clears my_cell=0 and mobs={} before the new map's
+                # GM|+ entity burst arrives. Without this wait, the next
+                # nearest_mob() sees mobs={}, falsely flags the map empty,
+                # and walks straight out -- bouncing through several maps
+                # before mob data catches up. my_cell repopulating from the
+                # GM|+ burst (which carries the mobs too) is the reliable
+                # "map has settled" signal.
+                if not wait_for(state, lambda s: s.my_cell != 0, 2.0, poll=0.05):
+                    print(f"[fighter] my_cell didn't populate within 2s of "
+                          f"map change to {snap.map_id}; proceeding anyway")
+                snap = state.snapshot()
 
             if snap.in_combat:
                 ents = snap.fight_entities

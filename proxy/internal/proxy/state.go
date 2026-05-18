@@ -248,6 +248,14 @@ func (s *stateTracker) Apply(pkt string) {
 		// packets arrive while we sit. Without parsing this we'd be
 		// stuck forever at the anchor HP. Client/proxy must time-extrapolate.
 		s.applyILS(pkt[3:])
+	case len(pkt) >= 4 && strings.HasPrefix(pkt, "ECK") && pkt[3] >= '0' && pkt[3] <= '9':
+		// ECK<kind>|<target_id> -- Exchange Create OK. Server confirms an
+		// exchange window opened (kind 4 = player merchant shop, others
+		// for NPC shops / trades / etc). The bot occasionally clicks a
+		// player in merchant mode while engaging and gets stuck on the
+		// shop; consumers listen for this event to dismiss it.
+		// Digit-guard so we don't match hypothetical future "ECKE" etc.
+		s.applyExchangeOpen(pkt[3:])
 	}
 }
 
@@ -523,21 +531,64 @@ func (s *stateTracker) applyAs(body string) {
 	}
 }
 
+// applyExchangeOpen parses "ECK<kind>|<target_id>" body (no leading "ECK")
+// and publishes an "exchange_open" event. Pure notification -- no state
+// change. The Python side schedules a delayed Esc to dismiss the window.
+func (s *stateTracker) applyExchangeOpen(body string) {
+	parts := strings.SplitN(body, "|", 2)
+	if len(parts) < 1 || parts[0] == "" {
+		return
+	}
+	kind, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return
+	}
+	target := 0
+	if len(parts) >= 2 {
+		target = atoiSafe(parts[1])
+	}
+	log.Printf("[state] exchange_open kind=%d target=%d", kind, target)
+	s.hub.Publish(map[string]interface{}{
+		"type":   "exchange_open",
+		"kind":   kind,
+		"target": target,
+		"ts":     time.Now().UnixMilli(),
+	})
+}
+
 // applyILS consumes the body of an "ILS<ms>" packet -- the server-stated
-// out-of-fight HP regen rate in milliseconds per +1 HP. Empirically this
-// is the SEATED baseline (1 HP / 1000 ms on Marx-Rockfeller); standing
-// regen is half that speed (1 HP / 2000 ms). Python applies the doubling
-// via Snapshot.effective_regen_ms based on ProxyState.sitting -- raw
-// value passes through here unmodified. Server emits it exactly once
-// right after each post-fight "As" anchor and never sends further HP
-// updates while we sit, so Python has to extrapolate from (anchor, rate).
+// out-of-fight HP regen rate in milliseconds per +1 HP. The server is
+// authoritative and sends the correct rate for the current state:
+// ILS1000 on sit, ILS2000 on stand (Marx-Rockfeller). Python must NOT
+// re-derive or scale this -- trust it verbatim.
+//
+// When the rate changes (sit<->stand) while we have an active anchor,
+// rebase: compute current HP using the OLD rate over the elapsed window,
+// then write that as the new anchor at now-ms with the new rate. Without
+// rebasing, the next extrapolation would apply the new rate to the
+// entire elapsed period since the anchor, skewing the estimate.
+//
 // Always emits a snapshot so the rate change propagates.
 func (s *stateTracker) applyILS(body string) {
 	ms, err := strconv.Atoi(strings.TrimSpace(body))
 	if err != nil || ms <= 0 {
 		return
 	}
+	nowMs := time.Now().UnixMilli()
 	s.mu.Lock()
+	if s.myLifeRegenMs > 0 && s.myLifeRegenMs != ms && s.myLifeAnchorMs > 0 && s.myLifeMax > 0 {
+		elapsed := nowMs - s.myLifeAnchorMs
+		if elapsed > 0 {
+			gained := int(elapsed / int64(s.myLifeRegenMs))
+			if gained > 0 {
+				s.myLife += gained
+				if s.myLife > s.myLifeMax {
+					s.myLife = s.myLifeMax
+				}
+			}
+		}
+		s.myLifeAnchorMs = nowMs
+	}
 	s.myLifeRegenMs = ms
 	s.mu.Unlock()
 	s.emitSnapshot()
