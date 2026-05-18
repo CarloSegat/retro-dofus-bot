@@ -17,7 +17,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from cell_grid import (
+from dofus.cell_grid import (
     CANVAS_MAX_SUBROW,
     CANVAS_MIN_SUBROW,
     CELLS_PER_PAIR,

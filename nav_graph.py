@@ -13,7 +13,7 @@ Sections:
   - Per-map summary: NSEW status per map.
   - Isolated maps:   no safe exit -- bot would be stuck on these.
 """
-from map_data import (
+from dofus.map_data import (
     DIRECTION_WORLD_DELTA,
     OPPOSITE_DIRECTION,
     build_world_index,

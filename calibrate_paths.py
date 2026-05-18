@@ -29,8 +29,8 @@ from pathlib import Path
 
 from pynput import keyboard, mouse
 
-from cell_grid import cell_to_uv, xy_to_cell
-from proxy_client import ProxyState
+from dofus.cell_grid import cell_to_uv, xy_to_cell
+from dofus.proxy_client import ProxyState
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
 MAP_DATA_DIR = Path(__file__).with_name("map_data")

@@ -21,7 +21,9 @@ blocked store at `~/.auto-fighter/blocked.json`.
 import json
 from pathlib import Path
 
-MAP_DATA_DIR = Path(__file__).with_name("map_data")
+# Map JSON files live at repo-root/map_data/, one level up from this
+# module's package directory.
+MAP_DATA_DIR = Path(__file__).resolve().parent.parent / "map_data"
 
 DIRECTION_WORLD_DELTA = {
     "north": (0, -1),

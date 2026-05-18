@@ -36,9 +36,9 @@ from types import SimpleNamespace
 
 import mss
 
-from cell_grid import a_star, cell_distance, cell_to_xy, line_of_sight, neighbors, on_map
+from dofus.cell_grid import a_star, cell_distance, cell_to_xy, line_of_sight, neighbors, on_map
 from fight import pass_turn
-from map_data import (
+from dofus.map_data import (
     DIRECTION_WORLD_DELTA,
     OPPOSITE_DIRECTION,
     build_world_index,
@@ -48,7 +48,7 @@ from map_data import (
     target_map_id,
 )
 from mouse_keyboard import click_at, click_at_focused, press, press_focused, type_text_focused
-from proxy_client import ProxyState
+from dofus.proxy_client import ProxyState
 from utils import CFG, make_ctx
 from vision import ensure_safe_to_resume
 
