@@ -1,0 +1,211 @@
+"""Orchestrator: top-level state machine that owns every other class.
+
+Reads runtime settings, wires the callback graph, then runs the main
+loop. The loop's job is to look at the current proxy snapshot and
+delegate to the right class:
+
+  in_combat       -> Combat.run() (the turn loop fires our callbacks)
+  in_placement    -> ready up + place starting cells + pass turn
+  idle, mob found -> Engager.try_engage
+  idle, no mob    -> MapNavigator.travel
+
+All class-to-class subscriptions happen in __init__. To understand who
+reacts to what, you read that block.
+"""
+import sys
+import time
+from types import SimpleNamespace
+
+import mss
+
+from dofus.actions import pass_turn
+from dofus.map_data import build_world_index, load_all as load_map_data
+from dofus.proxy_client import ProxyState
+from fighter.combat import Combat, TurnContext  # noqa: F401 (re-exported)
+from fighter.engager import Engager, COMBAT_START_TIMEOUT
+from fighter.helpers import (
+    IDLE_POLL_SEC,
+    PROXY_ADDR,
+    load_cal,
+    make_exchange_dismiss_callback,
+    prompt_int,
+    prompt_yn,
+    wait_for,
+)
+from fighter.navigator import MapNavigator
+from fighter.regen import HpRegen
+from fighter.sacrieur import (
+    DISSOLUTION_AP_COST,
+    DISSOLUTION_HOTKEY,
+    PASS_TURN_HOTKEY,
+    PASS_TURN_PRE_DELAY_SEC,
+    Sacrieur,
+)
+from utils import CFG, make_ctx
+
+
+def prompt_runtime_settings():
+    """Interactive startup questions. Returns SimpleNamespace with
+    buff_enabled, max_group_size, min_hp."""
+    print("[fighter] runtime settings (Enter for default):")
+    buff_enabled = prompt_yn("  cast Strength Punishment buff?",
+                             default=bool(CFG.get("sacrid_buff_enabled", True)))
+    max_group_size = prompt_int(
+        "  max mob group size to engage (0 = no cap)",
+        default=int(CFG.get("max_mob_group_size", 8)))
+    min_hp = prompt_int(
+        "  min HP before engaging",
+        default=int(CFG.get("min_hp_to_engage", 500)))
+    return SimpleNamespace(
+        buff_enabled=buff_enabled,
+        max_group_size=max_group_size,
+        min_hp=min_hp,
+    )
+
+
+class Orchestrator:
+    """Owns ProxyState and every other fighter class. Wires callbacks
+    in __init__; run() is the state machine loop."""
+
+    def __init__(self):
+        if not DISSOLUTION_HOTKEY:
+            print("config.json is missing 'sacrid_dissolution_hotkey'. Set it to "
+                  "the key Dissolution is bound to (e.g. \"2\").")
+            sys.exit(1)
+
+        self.args = prompt_runtime_settings()
+        self.cal = load_cal()
+        self.map_data = load_map_data()
+        self.map_by_world = build_world_index(self.map_data)
+        self._print_startup_banner()
+
+        self.state = ProxyState(PROXY_ADDR)
+        self.state.on_event(make_exchange_dismiss_callback())
+        self.state.start()
+        print(f"[fighter] connecting to proxy at {PROXY_ADDR}...")
+        if not wait_for(self.state, lambda s: s.connected and s.my_id != 0, 10.0):
+            snap = self.state.snapshot()
+            print(f"[fighter] proxy not ready: connected={snap.connected} "
+                  f"my_id={snap.my_id}")
+            sys.exit(1)
+        snap = self.state.snapshot()
+        print(f"[fighter] ready: my_id={snap.my_id} my_cell={snap.my_cell} "
+              f"map={snap.map_id}")
+
+        self._sct = mss.mss()
+        self._ctx = make_ctx(self._sct)
+
+        # --- Construct the classes ---
+        self.sacrieur = Sacrieur(self.state, self.cal, self.map_data,
+                                 buff_enabled=self.args.buff_enabled)
+        self.hp_regen = HpRegen(self.state, min_hp=self.args.min_hp)
+        self.engager = Engager(self.state, self.cal, self.hp_regen,
+                               self.map_data,
+                               max_group_size=self.args.max_group_size)
+        self.navigator = MapNavigator(self.state, self.cal, self.map_data,
+                                      self.map_by_world, self.engager)
+        self.combat = Combat(self.state, self._ctx)
+
+        # --- Wire callbacks (single source of truth) ---
+        self.combat.on_fight_engaged(self.sacrieur.on_fight_engaged)
+        self.combat.on_fight_engaged(self.hp_regen.on_fight_engaged)
+        self.combat.on_turn_start(self.sacrieur.play_turn)
+        self.combat.on_turn_start(self._log_turn)
+        self.combat.on_turn_end(self._log_turn_end)
+        self.combat.on_fight_ended(self._on_fight_ended)
+
+        # Orchestrator-level state
+        self.placed_for_engage_ts = 0.0
+        self.last_map_id = snap.map_id
+
+    def _print_startup_banner(self):
+        print(f"[fighter] cal: origin=({self.cal['origin_x']:.1f},"
+              f"{self.cal['origin_y']:.1f}) "
+              f"cell={self.cal['cell_w']:.2f}x{self.cal['cell_h']:.2f}")
+        print(f"[fighter] dissolution_hotkey={DISSOLUTION_HOTKEY!r} "
+              f"ap_cost={DISSOLUTION_AP_COST}")
+        print(f"[fighter] buff: {'enabled' if self.args.buff_enabled else 'DISABLED'}")
+        print(f"[fighter] min-hp threshold: wait until >= {self.args.min_hp} HP "
+              f"before engaging")
+        if self.args.max_group_size > 0:
+            print(f"[fighter] max-group-size: skip mob groups with > "
+                  f"{self.args.max_group_size} members")
+        else:
+            print(f"[fighter] max-group-size: no cap (engaging any group size)")
+        from dofus.map_data import safe_directions
+        with_switches = sum(1 for d in self.map_data.values() if d.get("switch_cells"))
+        with_safe = sum(1 for d in self.map_data.values()
+                        if safe_directions(d, self.map_by_world))
+        print(f"[fighter] navigation: {len(self.map_data)} map(s) calibrated, "
+              f"{with_switches} have switch_cells, "
+              f"{with_safe} have >= 1 return-safe neighbour")
+
+    # --- Combat callbacks owned by Orchestrator ---
+
+    def _log_turn(self, ctx):
+        me = ctx.snap.fight_entities.get(ctx.snap.my_id)
+        ap = me.ap if me else 0
+        mp = me.mp if me else 0
+        print(f"[orchestrator] turn {ctx.turn_n} (ap={ap} mp={mp})")
+
+    def _log_turn_end(self, ctx):
+        print(f"[orchestrator] turn {ctx.turn_n} end")
+
+    def _on_fight_ended(self, snap):
+        print(f"[orchestrator] fight ended; map={snap.map_id}")
+
+    # --- Main loop ---
+
+    def run(self):
+        try:
+            while True:
+                snap = self.state.snapshot()
+                if snap.map_id != self.last_map_id:
+                    self.navigator.on_map_changed(self.last_map_id, snap.map_id)
+                    self.last_map_id = snap.map_id
+                    snap = self.state.snapshot()
+
+                if snap.in_combat:
+                    self._tick_combat(snap)
+                    continue
+
+                if snap.in_placement:
+                    self._tick_placement(snap)
+                    continue
+
+                self._tick_idle(snap)
+        finally:
+            self._sct.close()
+
+    def _tick_combat(self, snap):
+        ents = snap.fight_entities
+        others = [e for e in ents.values() if e.id != snap.my_id]
+        print(f"[fighter] phase=combat (map={snap.map_id}) "
+              f"entities={len(ents)} enemies={len(others)}, running sacrid combat")
+        self.combat.run()
+
+    def _tick_placement(self, snap):
+        print(f"[fighter] phase=placement (map={snap.map_id}); readying up")
+        time.sleep(CFG["fight_ready_wait_sec"])
+        if snap.last_fight_engage_ts != self.placed_for_engage_ts:
+            self.engager.place_starting_cells(snap)
+            self.placed_for_engage_ts = snap.last_fight_engage_ts
+        pass_turn(PASS_TURN_HOTKEY, PASS_TURN_PRE_DELAY_SEC)
+        if not wait_for(self.state,
+                        lambda s: s.in_combat or not s.in_fight,
+                        COMBAT_START_TIMEOUT):
+            print(f"[fighter] still in placement after {COMBAT_START_TIMEOUT}s; "
+                  f"will press ready again next iteration")
+
+    def _tick_idle(self, snap):
+        target = self.engager.find_target(snap)
+        if target is None:
+            wait_ms = self.engager.all_walking_groups_filtered(snap)
+            if wait_ms is not None:
+                time.sleep(min(wait_ms / 1000.0 + 0.05, IDLE_POLL_SEC))
+                return
+            self.navigator.travel(snap, self.args.max_group_size)
+            return
+        # Got a target -- map isn't empty, clear cooldown then engage.
+        self.navigator.clear_empty_flag(snap.map_id)
+        self.engager.try_engage(target)
