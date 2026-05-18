@@ -1,92 +1,64 @@
 """Mouse and keyboard I/O for the bot.
 
-Input simulation is split between two backends by Dofus's requirements:
+One backend for injection (xdotool). One for listening (pynput, EscStop
+only). Layered:
 
-  pyautogui  -- regular clicks (engage / walk) and regular key presses
-                (`click`, `right_click`, `press`, `cursor_pos`,
-                `_move_mouse`).
-  xdotool    -- spell-aim clicks and any key event that needs the Dofus
-                window focused (`spell_click`, `press_xdotool`,
-                `type_xdotool`). pyautogui is silently dropped in
-                spell-aim mode; xdotool also lets us `windowactivate
-                --sync` first, which Wine requires before it accepts
-                synthetic input.
-  pynput     -- LISTENER ONLY (EscStop). pyautogui can inject but can't
-                listen.
+  Primitives      move_to(x,y) / click() / press(key)
+  Composed        click_at(x,y) = move_to + click
+                  type_text(text) = press per character
+  Focused         click_at_focused / press_focused / type_text_focused
+                  -- windowactivate --sync the Dofus window first
+                  before the action. Use when focus may have shifted
+                  (spell-aim clicks, post-fight Esc, chat typing).
 
-If a new Dofus mode silently drops pyautogui clicks, debug THAT case in
-isolation -- don't replace the working pyautogui paths wholesale.
+The un-focused variants assume Dofus already has focus from a prior
+user interaction. That's true in practice once the bot has clicked
+inside the game once. If a click silently no-ops, try the focused
+variant.
+
+Why no pyautogui: it was the original backend for the easy cases but
+silently dropped clicks in spell-aim mode and couldn't windowactivate.
+xdotool handles every case, so pyautogui is gone.
 """
 import subprocess
 import time
 
-import pyautogui
 from pynput import keyboard
 
-pyautogui.FAILSAFE = True  # move mouse to top-left corner to abort
-pyautogui.PAUSE = 0.05
+# Sleep after each xdotool call. The bot's timing was tuned with
+# pyautogui's PAUSE=0.05 implicit-pause in place; preserve it so the
+# click/key cadence stays roughly identical post-migration.
+# TODO(verify-bot-run): is 0.05s the right pause? If clicks now register
+# too fast (Dofus drops some) or too slow (bot feels sluggish), tune.
+_POST_ACTION_PAUSE_SEC = 0.05
 
 
-def _move_mouse(x, y, duration=0.1):
-    """Warp cursor to absolute screen (x, y)."""
-    pyautogui.moveTo(x, y, duration=duration)
+def _xdotool(*args):
+    """Run xdotool with args (no leading "xdotool"), raising on
+    non-zero exit, then sleep the post-action pause."""
+    subprocess.run(["xdotool", *args], check=True)
+    time.sleep(_POST_ACTION_PAUSE_SEC)
 
 
-def cursor_pos():
-    """Current cursor screen position as (x, y)."""
-    pos = pyautogui.position()
-    return int(pos.x), int(pos.y)
+def _focus_dofus_window():
+    """windowactivate --sync the Dofus Retro window so Wine accepts
+    synthetic input. Returns the window id (or None if not found) so
+    callers can pass --window to their xdotool action.
 
-
-def click(x, y):
-    """Move to (x, y), then left-click."""
-    _move_mouse(x, y)
-    pyautogui.click()
-
-
-def right_click(x, y):
-    """Move to (x, y), then right-click."""
-    _move_mouse(x, y)
-    pyautogui.rightClick()
-
-
-def spell_click(x, y):
-    """Click (x, y) via xdotool with a 120ms button-down delay,
-    targeted at the Dofus Retro window.
-
-    Use this for the second click of a spell cast (after pressing the
-    spell hotkey, when Dofus is in spell-aim mode). Empirically,
-    pyautogui's click is silently dropped in that mode -- the spell
-    stays armed, cursor on target, but `my_ap` never decrements and
-    the cast never fires. `xdotool click --delay 120 1` goes through.
-
-    We `windowactivate --sync` the Dofus window first (same workaround
-    as `press_xdotool`): under Wine, synthetic input is dropped when
-    the target window isn't focused, even when `--window` is set on
-    the xdotool command. See CLAUDE.md and memory
-    `feedback_xdotool_focus.md`."""
-    _move_mouse(x, y)
+    No POST_ACTION_PAUSE here -- windowactivate --sync already blocks
+    until the activation completes."""
     wid = dofus_window_id()
     if wid:
-        subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=False)
-    args = ["xdotool", "click", "--delay", "120"]
-    if wid:
-        args += ["--window", wid]
-    args.append("1")
-    subprocess.run(args, check=True)
+        subprocess.run(
+            ["xdotool", "windowactivate", "--sync", wid], check=False
+        )
+    return wid
 
 
-def press(key, hold_sec=0.1):
-    """Press a single key with a real human-length hold.
-
-    pyautogui.press fires keyDown+keyUp microseconds apart, which Dofus
-    retro silently drops for spell-hotkey arming (its handler samples
-    the key state at intervals and misses sub-millisecond taps).
-    ~100ms is enough to mimic a real keystroke; pass-turn keys work at
-    this hold too."""
-    pyautogui.keyDown(key)
-    time.sleep(hold_sec)
-    pyautogui.keyUp(key)
+def _maybe_window(wid):
+    """['--window', WID] when WID is set, else []. For inlining into
+    xdotool arg lists."""
+    return ["--window", wid] if wid else []
 
 
 _DOFUS_WINDOW_ID = None
@@ -113,57 +85,113 @@ def dofus_window_id():
     return _DOFUS_WINDOW_ID
 
 
-def press_xdotool(key, hold_sec=0.1):
-    """Press a key via xdotool keydown/sleep/keyup, targeted at the
-    Dofus Retro window when it can be found.
+# ============================================================
+# PRIMITIVES
+# ============================================================
 
-    Use when pyautogui's keystroke is silently dropped by Dofus (we hit
-    this for the post-fight Esc that should close the XP-summary popup
-    -- pyautogui press "esc" never reached the game because focus was
-    on the terminal). We `windowactivate` the Dofus window first
-    *and* pass `--window` to the key event: under Wine, synthetic key
-    events targeted at an unfocused window are dropped, so focus is
-    actually required despite the `--window` flag. Mirrors the
-    keydown+hold+keyup shape of `press` so sub-millisecond taps aren't
-    dropped by the client's input sampling. `key` uses X11 names
-    (e.g. "Escape", not "esc")."""
-    wid = dofus_window_id()
-    if wid:
-        subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=False)
-    base = ["xdotool"]
-    args_down = base + ["keydown"]
-    args_up = base + ["keyup"]
-    if wid:
-        args_down += ["--window", wid]
-        args_up += ["--window", wid]
-    args_down.append(key)
-    args_up.append(key)
-    subprocess.run(args_down, check=True)
+def move_to(x, y):
+    """Move the cursor to absolute screen (x, y). No click."""
+    _xdotool("mousemove", str(x), str(y))
+
+
+def click():
+    """Left-click at the current cursor position. No motion."""
+    _xdotool("click", "1")
+
+
+def press(key, hold_sec=0.1):
+    """Press one key with a 100ms button-down hold.
+
+    The hold mimics a real keystroke; Dofus retro samples input and
+    silently drops sub-millisecond down+up taps (we hit this with both
+    pyautogui.press and bare `xdotool key`). `key` uses X11 names
+    (e.g. 'Escape', not 'esc')."""
+    _xdotool("keydown", key)
     time.sleep(hold_sec)
-    subprocess.run(args_up, check=True)
+    _xdotool("keyup", key)
 
 
-def type_xdotool(text, delay_ms=20):
-    """Type a literal string into the Dofus window via xdotool.
+# ============================================================
+# COMPOSED (no focus)
+# ============================================================
 
-    Used for chat commands like "/sit" -- press Enter first to open the
-    chat, type the command, press Enter again to send. We windowactivate
-    so xdotool's `type` lands in Dofus rather than the terminal; without
-    focus, Wine drops synthetic input."""
-    wid = dofus_window_id()
-    if wid:
-        subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=False)
-    args = ["xdotool", "type", "--delay", str(delay_ms)]
-    if wid:
-        args += ["--window", wid]
-    args.append(text)
-    subprocess.run(args, check=True)
+def click_at(x, y):
+    """Move cursor + left-click at (x, y). Standard map click
+    (engage / walk).
+
+    No windowactivate -- relies on Dofus already having focus. If a
+    click silently no-ops, use click_at_focused instead."""
+    # TODO(verify-bot-run): pre-migration this was pyautogui.click();
+    # now it's xdotool. Did engage/walk clicks still land in your last
+    # run? If yes, remove this TODO.
+    move_to(x, y)
+    click()
+
+
+def type_text(text):
+    """Type a string by pressing each character in sequence.
+
+    Lowercase + symbols only -- no shift modifier handling. Built on
+    `press` rather than `xdotool type` so the 'typing = pressing keys'
+    model is visible in the code."""
+    for c in text:
+        press(c, hold_sec=0.02)
+
+
+# ============================================================
+# FOCUSED VARIANTS (windowactivate Dofus first)
+# ============================================================
+# Use when focus may have shifted -- spell-aim clicks, post-fight Esc,
+# chat typing. These pay the focus cost; the un-focused variants
+# above rely on Dofus already owning keyboard/click focus from the
+# user's last interaction.
+
+def click_at_focused(x, y):
+    """Move cursor, windowactivate Dofus, then click with a 120ms
+    button-down delay targeted at the Dofus window.
+
+    Use for the second click of a spell cast (spell-aim mode). Regular
+    click_at is silently dropped there -- the spell stays armed,
+    cursor on target, but my_ap never decrements. The 120ms delay plus
+    explicit --window targeting gets the cast through. See CLAUDE.md
+    and memory feedback_spell_click_pynput.md."""
+    move_to(x, y)
+    wid = _focus_dofus_window()
+    _xdotool("click", "--delay", "120", *_maybe_window(wid), "1")
+
+
+def press_focused(key, hold_sec=0.1):
+    """Press one key after windowactivate, with keyup/keydown
+    --window-targeted at Dofus.
+
+    Use when focus may have shifted (post-fight Esc -- the XP-summary
+    transition can leave focus on the terminal, and an un-focused key
+    event is dropped by Wine)."""
+    wid = _focus_dofus_window()
+    _xdotool("keydown", *_maybe_window(wid), key)
+    time.sleep(hold_sec)
+    _xdotool("keyup", *_maybe_window(wid), key)
+
+
+def type_text_focused(text):
+    """Type a string into the focused Dofus window: focus once, then
+    `press` each character.
+
+    Used for chat commands like '/sit'. Lowercase + symbols only --
+    same shift-handling caveat as type_text."""
+    # TODO(verify-bot-run): pre-migration this was xdotool type
+    # --delay 20 in one shot; now it's press-per-char (focus + plain
+    # press). Did the /sit chat command still type correctly in your
+    # last run? If yes, remove this TODO.
+    _focus_dofus_window()
+    for c in text:
+        press(c, hold_sec=0.02)
 
 
 class EscStop:
     """Esc-to-stop flag with pause/resume so callers can synthesize Esc
     presses without our own listener catching them. Uses
-    pynput.keyboard.Listener for capture (pyautogui can't listen)."""
+    pynput.keyboard.Listener for capture (xdotool can't listen)."""
 
     def __init__(self):
         self.stop = False

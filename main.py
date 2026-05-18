@@ -47,7 +47,7 @@ from map_data import (
     save as save_map_data,
     target_map_id,
 )
-from mouse_keyboard import click, press, press_xdotool, spell_click, type_xdotool
+from mouse_keyboard import click_at, click_at_focused, press, press_focused, type_text_focused
 from proxy_client import ProxyState
 from utils import CFG, make_ctx
 from vision import ensure_safe_to_resume
@@ -264,7 +264,7 @@ def make_exchange_dismiss_callback():
         def fire():
             print(f"[fighter] exchange_open (kind={kind} target={target}) -> Esc")
             try:
-                press_xdotool("Escape")
+                press_focused("Escape")
             except Exception as e:
                 print(f"[fighter] exchange Esc failed: {e}")
         threading.Timer(1.0, fire).start()
@@ -279,11 +279,11 @@ def sit_for_regen(state):
     wait_for_hp invokes us we're known standing. Cleared automatically
     on fight_engage."""
     print("[fighter] /sit to regen faster")
-    press_xdotool("Return")
+    press_focused("Return")
     time.sleep(0.3)
-    type_xdotool("/sit")
+    type_text_focused("/sit")
     time.sleep(0.3)
-    press_xdotool("Return")
+    press_focused("Return")
     state.set_sitting(True)
 
 
@@ -523,14 +523,14 @@ def walk_away(away_from, state, cal, static_obstacles, max_steps):
         print(f"  RETREAT {steps_taken + 1}/{max_steps} from {me_cell} -> "
               f"cell={step} ({sx},{sy}) [mp_left~{estimated_mp}]")
         before = me_cell
-        click(sx, sy)
+        click_at(sx, sy)
         moved = _wait_movement(state, before, WALK_STEP_WAIT_SEC)
         if not moved:
             print(f"    no movement from {before} -> cell={step} ({sx},{sy}); "
                   f"settling {WALK_STEP_SETTLE_SEC}s and retrying")
             time.sleep(WALK_STEP_SETTLE_SEC)
             before = my_fight_cell(state.snapshot()) or before
-            click(sx, sy)
+            click_at(sx, sy)
             moved = _wait_movement(state, before, WALK_STEP_WAIT_SEC)
         steps_taken += 1
         if moved:
@@ -563,7 +563,7 @@ def place_starting_cells(snap, cal):
     for cell in cells:
         x, y = cell_to_screen(cell, cal)
         print(f"  start_click cell={cell} -> ({x},{y})")
-        click(x, y)
+        click_at(x, y)
         time.sleep(0.3)
 
 
@@ -609,7 +609,7 @@ def cast_dissolution(my_cell, cal):
     print(f"  CAST Dissolution hotkey={DISSOLUTION_HOTKEY!r} self_cell={my_cell} -> ({x},{y})")
     press(DISSOLUTION_HOTKEY)
     time.sleep(0.4)  # let Dofus enter spell-aim mode and show the reticle
-    spell_click(x, y)
+    click_at_focused(x, y)
 
 
 def cast_strength_punishment(my_cell, cal):
@@ -620,7 +620,7 @@ def cast_strength_punishment(my_cell, cal):
     print(f"  CAST Strength Punishment hotkey={BUFF_HOTKEY!r} self_cell={my_cell} -> ({x},{y})")
     press(BUFF_HOTKEY)
     time.sleep(0.4)
-    spell_click(x, y)
+    click_at_focused(x, y)
 
 
 def cast_bow(target_cell, cal):
@@ -630,7 +630,7 @@ def cast_bow(target_cell, cal):
     print(f"  CAST Bow hotkey={BOW_HOTKEY!r} target_cell={target_cell} -> ({x},{y})")
     press(BOW_HOTKEY)
     time.sleep(0.4)
-    spell_click(x, y)
+    click_at_focused(x, y)
 
 
 def pick_bow_target(snap, me_cell, static_obstacles, debug=False):
@@ -811,7 +811,7 @@ def try_full_walk(target_cell, state, cal, static_obstacles=(), mp_override=None
     sx, sy = cell_to_screen(dest_cell, cal)
     print(f"  FULL WALK from {me_cell} -> cell={dest_cell} ({sx},{sy}) "
           f"[mp={mp} planned_steps={max_steps} target={target_cell}]")
-    click(sx, sy)
+    click_at(sx, sy)
 
     moved = _wait_movement(state, me_cell, walk_wait)
     if not moved:
@@ -917,14 +917,14 @@ def walk_toward(target_cell, state, cal, static_obstacles=(), mp_override=None,
         print(f"  STEP {steps_taken + 1}/{WALK_MAX_STEPS} from {me_cell} -> cell={step} "
               f"({sx},{sy}) [mp_left~{estimated_mp} dist={dist}]")
         before = me_cell
-        click(sx, sy)
+        click_at(sx, sy)
         moved = _wait_movement(state, before, walk_wait)
         if not moved and not fast_fail:
             print(f"    no movement from {before} -> cell={step} ({sx},{sy}); "
                   f"settling {WALK_STEP_SETTLE_SEC}s and retrying")
             time.sleep(WALK_STEP_SETTLE_SEC)
             before = my_fight_cell(state.snapshot()) or before
-            click(sx, sy)
+            click_at(sx, sy)
             moved = _wait_movement(state, before, walk_wait)
 
         steps_taken += 1
@@ -1435,9 +1435,9 @@ def main():
                 # XP summary take focus, then Esc closes it. The 4s
                 # pre-wait gives both popups time to render.
                 time.sleep(4.0)
-                press_xdotool("Return")
+                press_focused("Return")
                 time.sleep(1.0)
-                press_xdotool("Escape")
+                press_focused("Escape")
                 time.sleep(0.3)
                 if not ensure_safe_to_resume(ctx):
                     print("[fighter] menu still open after Esc -- aborting")
@@ -1522,7 +1522,7 @@ def main():
                           f"walking {direction} (fresh={fresh}{skip_note}, "
                           f"avoid={excluded}) to switch cell={switch_cell} "
                           f"-> screen=({x},{y}); target map={tgt_mid_str} world={tgt_world_str}")
-                    ctx.click(x, y)
+                    ctx.click_at(x, y)
                     last_walk_direction = direction
                     before_map = snap.map_id
                     if wait_for(state,
@@ -1595,7 +1595,7 @@ def main():
             print(f"[fighter] engaging nearest mob: cell={cell} dist={d} "
                   f"group={mob.group_id} members={mob.members} "
                   f"hp~{hp_snap.estimated_life()}/{hp_snap.my_life_max} -> screen=({x},{y})")
-            ctx.click(x, y)
+            ctx.click_at(x, y)
             if wait_for(state, lambda s: s.in_fight, ENGAGE_TIMEOUT):
                 print(f"[fighter] fight_engage received (phase={state.snapshot().fight_phase})")
                 continue
@@ -1616,7 +1616,7 @@ def main():
             print(f"[fighter] nearest didn't engage; trying next-nearest mob: "
                   f"cell={acell} dist={d2} group={amob.group_id} "
                   f"members={amob.members} -> screen=({ax},{ay})")
-            ctx.click(ax, ay)
+            ctx.click_at(ax, ay)
             if wait_for(state, lambda s: s.in_fight, ENGAGE_TIMEOUT):
                 print(f"[fighter] fight_engage received (phase={state.snapshot().fight_phase})")
             else:

@@ -1,6 +1,5 @@
 mss
 numpy
-pyautogui
 pynput
 pytesseract
 Pillow

@@ -1,4 +1,4 @@
-"""Pass-turn hotkey. Thin wrapper around mouse_keyboard.press (pyautogui)."""
+"""Pass-turn hotkey. Thin wrapper around mouse_keyboard.press (xdotool)."""
 import time
 
 from mouse_keyboard import press

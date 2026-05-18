@@ -17,7 +17,7 @@ import numpy as np
 import pytesseract
 from PIL import Image
 
-from mouse_keyboard import press_xdotool
+from mouse_keyboard import press_focused
 
 DEBUG_DIR = Path(__file__).resolve().parent.parent / "debug"
 DEBUG_DIR.mkdir(exist_ok=True)
@@ -120,7 +120,7 @@ def ensure_safe_to_resume(ctx, max_retries=4, wait_sec=0.4):
         if hit is None:
             return True
         print(f"[popup] attempt {attempt}/{max_retries}: '{hit}' visible -> pressing Esc")
-        press_xdotool("Escape")
+        press_focused("Escape")
         time.sleep(wait_sec)
     final_hit = detect_menu_keyword(ctx, tag="final")
     if final_hit is None:
