@@ -28,8 +28,6 @@ from pynput import keyboard
 # Sleep after each xdotool call. The bot's timing was tuned with
 # pyautogui's PAUSE=0.05 implicit-pause in place; preserve it so the
 # click/key cadence stays roughly identical post-migration.
-# TODO(verify-bot-run): is 0.05s the right pause? If clicks now register
-# too fast (Dofus drops some) or too slow (bot feels sluggish), tune.
 _POST_ACTION_PAUSE_SEC = 0.05
 
 
@@ -121,21 +119,19 @@ def click_at(x, y):
 
     No windowactivate -- relies on Dofus already having focus. If a
     click silently no-ops, use click_at_focused instead."""
-    # TODO(verify-bot-run): pre-migration this was pyautogui.click();
-    # now it's xdotool. Did engage/walk clicks still land in your last
-    # run? If yes, remove this TODO.
     move_to(x, y)
     click()
 
 
 def type_text(text):
-    """Type a string by pressing each character in sequence.
+    """Type a string into whatever currently has focus.
 
-    Lowercase + symbols only -- no shift modifier handling. Built on
-    `press` rather than `xdotool type` so the 'typing = pressing keys'
-    model is visible in the code."""
-    for c in text:
-        press(c, hold_sec=0.02)
+    Conceptually this is "press each key in sequence." We delegate to
+    `xdotool type` rather than looping `press(c)` because special chars
+    like '/' aren't valid X11 keysyms for bare keydown/keyup (the keysym
+    is `slash`, not the literal '/'). xdotool's `type` knows the
+    layout-to-keysym mapping and handles shift modifiers for us."""
+    _xdotool("type", "--delay", "20", text)
 
 
 # ============================================================
@@ -174,18 +170,15 @@ def press_focused(key, hold_sec=0.1):
 
 
 def type_text_focused(text):
-    """Type a string into the focused Dofus window: focus once, then
-    `press` each character.
+    """Type a string into the focused Dofus window.
 
-    Used for chat commands like '/sit'. Lowercase + symbols only --
-    same shift-handling caveat as type_text."""
-    # TODO(verify-bot-run): pre-migration this was xdotool type
-    # --delay 20 in one shot; now it's press-per-char (focus + plain
-    # press). Did the /sit chat command still type correctly in your
-    # last run? If yes, remove this TODO.
-    _focus_dofus_window()
-    for c in text:
-        press(c, hold_sec=0.02)
+    windowactivate first; Wine drops synthetic input otherwise. Uses
+    xdotool's `type` command, not per-character `press`, because chat
+    commands contain '/' and other chars that aren't valid X11 keysyms
+    for bare keydown/keyup (`/` needs keysym `slash`). Used for chat
+    commands like '/sit'."""
+    wid = _focus_dofus_window()
+    _xdotool("type", "--delay", "20", *_maybe_window(wid), text)
 
 
 class EscStop:
