@@ -37,7 +37,6 @@ from types import SimpleNamespace
 import mss
 
 from cell_grid import a_star, cell_distance, cell_to_xy, line_of_sight, neighbors, on_map
-from dialogs import ensure_safe_to_resume
 from fight import pass_turn
 from map_data import (
     DIRECTION_WORLD_DELTA,
@@ -48,8 +47,10 @@ from map_data import (
     save as save_map_data,
     target_map_id,
 )
+from mouse_keyboard import click, press, press_xdotool, spell_click, type_xdotool
 from proxy_client import ProxyState
-from utils import CFG, click, make_ctx, press, press_xdotool, spell_click, type_xdotool
+from utils import CFG, make_ctx
+from vision import ensure_safe_to_resume
 
 MAP_DATA = load_map_data()  # {map_id: {"world", "map_id", "cells", "obstacles", ...}}
 MAP_BY_WORLD = build_world_index(MAP_DATA)  # {(world_x, world_y): entry}

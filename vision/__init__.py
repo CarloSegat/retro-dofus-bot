@@ -1,17 +1,37 @@
-"""Detect and click 'Ignore [player]' link in trade/challenge dialogs via OCR."""
+"""Computer vision: screen capture + OCR-based popup detection.
+
+The bot is proxy-driven, not screen-driven -- it reads game state off
+the wire, not off pixels. CV exists only for popups the proxy can't see
+(trade/challenge dialogs, character-selection menu) and debug rendering.
+
+Backends:
+  mss          -- raw screen grab (caller supplies the mss.mss() instance)
+  numpy        -- ndarray view of the captured frame
+  PIL          -- Image for pytesseract handoff
+  pytesseract  -- OCR engine
+"""
 import time
 from pathlib import Path
+
+import numpy as np
 import pytesseract
 from PIL import Image
 
-from utils import press_xdotool
+from mouse_keyboard import press_xdotool
 
-DEBUG_DIR = Path(__file__).with_name("debug")
+DEBUG_DIR = Path(__file__).resolve().parent.parent / "debug"
 DEBUG_DIR.mkdir(exist_ok=True)
 
 # Words that signal the in-game popup menu is open. Hitting any of these
 # coordinates with a mining click is dangerous (Logout = lose the session).
 MENU_KEYWORDS = ("logout", "log out", "character selection", "quit", "exit")
+
+
+def grab_region(sct, x, y, w, h):
+    """RGB ndarray of a screen rectangle. `sct` is an mss.mss() instance."""
+    mon = {"left": x, "top": y, "width": w, "height": h}
+    img = np.array(sct.grab(mon))[:, :, :3]
+    return img[:, :, ::-1]
 
 
 def _grab_dialog_region(ctx):

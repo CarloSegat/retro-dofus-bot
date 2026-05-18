@@ -1,8 +1,9 @@
 """Standalone: poll for trade/challenge dialog and click Ignore. Esc stops."""
 import time
 import mss
-from utils import CFG, make_ctx, EscStop
-from dialogs import dismiss_dialog
+from mouse_keyboard import EscStop
+from utils import CFG, make_ctx
+from vision import dismiss_dialog
 
 
 def run():

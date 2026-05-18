@@ -1,7 +1,7 @@
-"""Pass-turn hotkey. Thin wrapper -- all simulated input goes through utils.press (xdotool)."""
+"""Pass-turn hotkey. Thin wrapper around mouse_keyboard.press (pyautogui)."""
 import time
 
-from utils import press
+from mouse_keyboard import press
 
 
 def pass_turn(ctx):
