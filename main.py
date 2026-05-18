@@ -26,12 +26,12 @@ Pre-reqs: proxy running on 127.0.0.1:9999, config.json has
 cell_calibration + sacrid_dissolution_hotkey. See CLAUDE.md for config
 knobs.
 """
-import argparse
 import json
 import random
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import mss
 
@@ -44,6 +44,7 @@ from map_data import (
     build_world_index,
     load_all as load_map_data,
     safe_directions,
+    save as save_map_data,
     target_map_id,
 )
 from proxy_client import ProxyState
@@ -74,6 +75,9 @@ BOW_MAX_RANGE = int(CFG.get("sacrid_bow_max_range", 6))
 # pending_settle's floor is a hair too short for weapon-arming.
 BOW_POST_WALK_EXTRA_SETTLE_SEC = float(CFG.get("sacrid_bow_post_walk_settle_sec", 0.33))
 # Strength Punishment self-buff: hotkey + click own cell.
+# Set sacrid_buff_enabled=false to skip the buff entirely (e.g. when
+# farming low-level mobs where the AP is better spent on damage).
+BUFF_ENABLED = bool(CFG.get("sacrid_buff_enabled", True))
 BUFF_HOTKEY = CFG.get("sacrid_buff_hotkey", "3")
 BUFF_AP_COST = int(CFG.get("sacrid_buff_ap_cost", 3))
 # Skip buff if nearest enemy > this many Po away -- buff triggers on
@@ -321,13 +325,21 @@ def nearest_mob(snap, ghosts=(), max_group_size=0):
 
     `max_group_size > 0`: skip groups with > N members.
 
+    Mobs whose `move_ends_at_ms` is in the future are skipped: the proxy
+    re-keys s.mobs to the destination cell the instant it sees GA0;1;
+    but Dofus needs ~steps*400ms to animate the sprite there. A click
+    on the destination during the animation registers as a walk, not
+    an engage. Wait one IDLE_POLL tick and re-pick.
+
     When my_cell is 0 (proxy just attached) we return an arbitrary mob
     with distance=-1 so the caller still tries to engage."""
     ghost_set = set(ghosts)
+    now_ms = int(time.time() * 1000)
     candidates = [
         (c, m) for c, m in snap.mobs.items()
         if (c, m.group_id) not in ghost_set
         and (max_group_size <= 0 or len(m.members) <= max_group_size)
+        and m.move_ends_at_ms <= now_ms
     ]
     if not candidates:
         return None
@@ -359,6 +371,15 @@ def alive_enemies(snap):
     return enemies
 
 
+def _path_repr(path, max_cells=10):
+    """Compact log-friendly repr of an A* path. Truncates very long paths."""
+    if path is None:
+        return "None"
+    if len(path) <= max_cells:
+        return str(path)
+    return f"{path[:max_cells]}+{len(path) - max_cells}more"
+
+
 def pick_next_step(me_cell, target_cell, snap, recent_failed, static_obstacles):
     """Pick one cell to step into toward `target_cell`. Returns None if
     no walkable neighbour strictly improves Po distance.
@@ -379,7 +400,14 @@ def pick_next_step(me_cell, target_cell, snap, recent_failed, static_obstacles):
     plan_blocked = (static | rf) - {target_cell}
     path = a_star(me_cell, target_cell, blocked=plan_blocked)
     if path and len(path) >= 2 and path[1] not in dynamic:
+        print(f"    [pick_step] src=astar me={me_cell} target={target_cell} "
+              f"path={_path_repr(path)} pick={path[1]} "
+              f"static={len(static)} rf={sorted(rf) or '[]'} "
+              f"dyn={sorted(dynamic) or '[]'}")
         return path[1]
+
+    astar_note = (f"path={_path_repr(path)} but path[1]={path[1]} blocked by dynamic"
+                  if path and len(path) >= 2 else f"path={_path_repr(path)}")
 
     # Fallback: walk one tile toward target, dodging live entities. Matches
     # the pre-A* greedy behaviour so a mid-corridor mob doesn't pin us.
@@ -397,8 +425,15 @@ def pick_next_step(me_cell, target_cell, snap, recent_failed, static_obstacles):
             continue
         cands.append((d, n))
     if not cands:
+        print(f"    [pick_step] src=NONE me={me_cell} target={target_cell} "
+              f"({astar_note}) no greedy candidate "
+              f"(current_dist={current_dist} static={len(static)} "
+              f"rf={sorted(rf) or '[]'} dyn={sorted(dynamic) or '[]'})")
         return None
     cands.sort()
+    print(f"    [pick_step] src=greedy me={me_cell} target={target_cell} "
+          f"({astar_note}) pick={cands[0][1]} "
+          f"(current_dist={current_dist} candidates={cands})")
     return cands[0][1]
 
 
@@ -500,6 +535,36 @@ def place_starting_cells(snap, cal):
         print(f"  start_click cell={cell} -> ({x},{y})")
         click(x, y)
         time.sleep(0.3)
+
+
+def prune_obstacles_from_entities(map_id, snap):
+    """Drop any obstacle cell now occupied by a live entity (us or enemies),
+    plus any saved player start cell. Calibration sometimes mis-clicks
+    mob spawn cells as obstacles, which then makes A* return None when
+    we land on one (the start-in-blocked guard) or forces multi-cell
+    detours around cells nothing actually blocks.
+
+    No-op if nothing changed. Mutates the in-memory MAP_DATA entry and
+    persists to the JSON file."""
+    entry = MAP_DATA.get(map_id)
+    if not entry:
+        return
+    obstacles = entry.get("obstacles") or []
+    if not obstacles:
+        return
+    occupied = {e.cell for e in snap.fight_entities.values()
+                if e.alive and e.cell > 0}
+    occupied |= {c for c in (entry.get("cells") or []) if c > 0}
+    if not occupied:
+        return
+    drop = [c for c in obstacles if c in occupied]
+    if not drop:
+        return
+    new_obs = [c for c in obstacles if c not in occupied]
+    entry["obstacles"] = new_obs
+    save_map_data(entry)
+    print(f"  pruned {len(drop)} mis-calibrated obstacle(s) for map={map_id} "
+          f"(occupied by start/entity): {sorted(drop)}")
 
 
 def cast_dissolution(my_cell, cal):
@@ -639,10 +704,15 @@ def try_full_walk(target_cell, state, cal, static_obstacles=(), mp_override=None
     if mp <= 0 or not me_cell:
         return False, me_cell, mp, 0.0
 
-    path = a_star(me_cell, target_cell, blocked=set(static_obstacles) - {target_cell})
+    obs_set = set(static_obstacles)
+    path = a_star(me_cell, target_cell, blocked=obs_set - {target_cell})
+    print(f"  [full_walk] me={me_cell} target={target_cell} mp={mp} "
+          f"static_obstacles={len(obs_set)} path={_path_repr(path)}")
     # path[0] is me_cell, path[-1] is target. We need at least one cell
     # between them to walk to (path[-2] = adjacent to target).
     if not path or len(path) < 3:
+        print(f"    [full_walk] no usable path (len={len(path) if path else 0}); "
+              f"caller falls back to step-by-step")
         return False, me_cell, mp, 0.0
 
     max_steps = min(mp, len(path) - 2)
@@ -656,12 +726,26 @@ def try_full_walk(target_cell, state, cal, static_obstacles=(), mp_override=None
         e.cell for e in snap.fight_entities.values()
         if e.alive and e.cell > 0 and e.cell != target_cell
     }
+    pulled = 0
     while max_steps > 0 and path[max_steps] in dynamic:
         max_steps -= 1
+        pulled += 1
+    if pulled:
+        print(f"    [full_walk] pulled dest back {pulled} step(s) past "
+              f"dynamic entities={sorted(dynamic)}")
     if max_steps <= 0:
+        print(f"    [full_walk] entire path blocked by dynamic entities; "
+              f"caller falls back to step-by-step")
         return False, me_cell, mp, 0.0
 
     dest_cell = path[max_steps]
+    # Belt-and-braces: A* should never put a static obstacle on the path,
+    # but if it did (bug, stale data, target itself an obstacle), flag it
+    # in the log -- the click will fail and we want it obvious why.
+    if dest_cell in obs_set:
+        print(f"    [full_walk] WARNING dest_cell={dest_cell} is in static "
+              f"obstacles ({sorted(obs_set & set(path))} appear on path); "
+              f"clicking anyway, expect Dofus to reject")
     sx, sy = cell_to_screen(dest_cell, cal)
     print(f"  FULL WALK from {me_cell} -> cell={dest_cell} ({sx},{sy}) "
           f"[mp={mp} planned_steps={max_steps} target={target_cell}]")
@@ -721,6 +805,12 @@ def walk_toward(target_cell, state, cal, static_obstacles=(), mp_override=None,
     and spending the usual 1s + 0.5s + 1s per dead step (~2.5s) on each
     of several cells is 5-10s of pure latency before we finally pass."""
     walk_wait = WALK_STEP_FAST_FAIL_SEC if fast_fail else WALK_STEP_WAIT_SEC
+    _entry_snap = state.snapshot()
+    _me_entry = my_fight_cell(_entry_snap)
+    print(f"  [walk_toward] entry me={_me_entry} target={target_cell} "
+          f"mp_override={mp_override} fast_fail={fast_fail} "
+          f"static_obstacles={len(static_obstacles)} "
+          f"map_id={_entry_snap.map_id}")
     full_ok, new_cell, mp_remaining, pending_settle = try_full_walk(
         target_cell, state, cal, static_obstacles,
         mp_override=mp_override, walk_wait_sec=walk_wait)
@@ -838,6 +928,7 @@ def run_combat_sacrid(ctx, state, cal):
     # Initialised so the cooldown check passes on turn 1 (no prior cast).
     last_buff_turn = -BUFF_COOLDOWN_TURNS
     map_id = state.snapshot().map_id
+    prune_obstacles_from_entities(map_id, state.snapshot())
     static_obstacles = set((MAP_DATA.get(map_id) or {}).get("obstacles") or ())
     if static_obstacles:
         print(f"  loaded {len(static_obstacles)} static obstacle(s) "
@@ -913,7 +1004,19 @@ def run_combat_sacrid(ctx, state, cal):
             # kiter we already know we can't catch).
             can_bow = (my_ap >= BOW_AP_COST
                        and pick_bow_target(snap, me_cell, static_obstacles) is not None)
-            if not will_attack and not can_retreat and not can_bow:
+            # Walking a few cells into bow range is fine even in tofu mode --
+            # one shot + retreat with leftover MP beats passing while the
+            # kiter free-shoots us at max range. Only fires when bow already
+            # can't hit from here (otherwise just shoot, save the MP).
+            steps_into_bow = (dist - BOW_MAX_RANGE
+                              if me_cell is not None and dist > BOW_MAX_RANGE
+                              else 0)
+            can_walk_to_bow = (not can_bow
+                               and my_ap >= BOW_AP_COST
+                               and steps_into_bow > 0
+                               and steps_into_bow <= my_mp
+                               and not (can_reach and can_attack))
+            if not will_attack and not can_retreat and not can_bow and not can_walk_to_bow:
                 print(f"  [tofu] cornered at {me_cell}: no retreat step "
                       f"from id={nearest.id} cell={nearest.cell} dist={dist} "
                       f"and can't close+cast (mp={my_mp} ap={my_ap}) "
@@ -944,6 +1047,21 @@ def run_combat_sacrid(ctx, state, cal):
                         time.sleep(CAST_WAIT_SEC)
                         my_ap -= DISSOLUTION_AP_COST
                         pending_settle = 0.0
+                elif can_walk_to_bow:
+                    # Can't close+cast melee, but walking `steps_into_bow`
+                    # cells puts nearest into bow range. Cap mp_override so
+                    # walk_toward stops at the bow-range edge instead of
+                    # closing to melee -- saves MP for the retreat below.
+                    print(f"  [tofu] walking {steps_into_bow} step(s) into "
+                          f"bow range (dist={dist}, bow_max={BOW_MAX_RANGE}, "
+                          f"mp={my_mp}, ap={my_ap})")
+                    before_cell = me_cell
+                    me_cell, _, _, pending_settle = walk_toward(
+                        nearest.cell, state, cal, static_obstacles,
+                        mp_override=steps_into_bow)
+                    steps_used = (cell_distance(before_cell, me_cell)
+                                  if me_cell and before_cell else 0)
+                    mp_remaining = max(0, my_mp - steps_used)
                 elif dist == 1 and can_attack:
                     # Already adjacent (their MP ran out next to us) -- punish.
                     cast_dissolution(me_cell, cal)
@@ -987,7 +1105,9 @@ def run_combat_sacrid(ctx, state, cal):
                         if me_cell else 99)
         turns_since_buff = new_turn - last_buff_turn
         buff_ready = turns_since_buff >= BUFF_COOLDOWN_TURNS
-        if buff_ready and me_cell and my_ap >= BUFF_AP_COST:
+        if not BUFF_ENABLED:
+            pass  # sacrid_buff_enabled=false: skip Strength Punishment entirely
+        elif buff_ready and me_cell and my_ap >= BUFF_AP_COST:
             if nearest_dist <= BUFF_MAX_DIST:
                 print(f"  buff: nearest_dist={nearest_dist} <= {BUFF_MAX_DIST}, "
                       f"cooldown ready (last_cast_turn={last_buff_turn}), casting")
@@ -1080,25 +1200,61 @@ def run_combat_sacrid(ctx, state, cal):
         pass_turn(ctx)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Proxy-driven Sacrieur auto-fighter")
-    parser.add_argument("--min-hp", type=int, default=100,
-                        help="wait until current HP >= this before engaging "
-                             "(default 100; capped at max HP)")
-    parser.add_argument("--max-group-size", type=int, default=0,
-                        help="skip mob groups with more than N members "
-                             "(default 0 = no cap). E.g. 3 ignores groups of 4+.")
-    args = parser.parse_args()
+def _prompt_int(label, default):
+    while True:
+        raw = input(f"{label} [{default}]: ").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            print(f"  not a number: {raw!r}")
 
+
+def _prompt_yn(label, default=True):
+    suffix = "Y/n" if default else "y/N"
+    while True:
+        raw = input(f"{label} [{suffix}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print(f"  answer y or n (got {raw!r})")
+
+
+def prompt_runtime_settings():
+    """Interactive prompts for per-run settings. Overrides the config
+    defaults at startup so the operator doesn't have to hand-edit
+    config.json between farming sessions."""
+    print("[fighter] runtime settings (press enter for default):")
+    buff = _prompt_yn("  cast Strength Punishment buff?", default=True)
+    max_group = _prompt_int("  max mob group size", default=8)
+    min_hp = _prompt_int("  min HP before engaging", default=500)
+    return SimpleNamespace(
+        buff_enabled=buff,
+        max_group_size=max_group,
+        min_hp=min_hp,
+    )
+
+
+def main():
     if not DISSOLUTION_HOTKEY:
         print("config.json is missing 'sacrid_dissolution_hotkey'. Set it to the "
               "key Dissolution is bound to on Marx-Rockfeller's spell bar (e.g. \"2\").")
         sys.exit(1)
 
+    args = prompt_runtime_settings()
+    # Override the module-level BUFF_ENABLED so run_combat_sacrid (which
+    # reads it as a module global) picks up the operator's choice.
+    globals()["BUFF_ENABLED"] = args.buff_enabled
+
     cal = load_cal()
     print(f"[fighter] cal: origin=({cal['origin_x']:.1f},{cal['origin_y']:.1f}) "
           f"cell={cal['cell_w']:.2f}x{cal['cell_h']:.2f}")
     print(f"[fighter] dissolution_hotkey={DISSOLUTION_HOTKEY!r} ap_cost={DISSOLUTION_AP_COST}")
+    print(f"[fighter] buff: {'enabled' if args.buff_enabled else 'DISABLED (skipping Strength Punishment)'}")
     print(f"[fighter] min-hp threshold: wait until >= {args.min_hp} HP before engaging")
     if args.max_group_size > 0:
         print(f"[fighter] max-group-size: skip mob groups with > {args.max_group_size} members")
@@ -1138,6 +1294,14 @@ def main():
         # picking a navigation target; entries expire after
         # EMPTY_MAP_RESPAWN_SEC and are cleared on successful engage.
         recently_empty_maps: dict[int, float] = {}
+        # Count of back-to-back failed switch-cell walks. Resets on any
+        # successful map change. Dofus disconnects after ~30min idle, so
+        # if we burn many MAP_CHANGE_TIMEOUT cycles in a row the clicks
+        # aren't producing real movement -- calibration drift, blocked
+        # path, or off-map switch_cell. Print a loud warning so the
+        # operator notices before the inactivity kick.
+        consecutive_walk_failures = 0
+        STUCK_WARN_THRESHOLD = 5
 
         while True:
             snap = state.snapshot()
@@ -1147,6 +1311,7 @@ def main():
                           f"clearing {len(ghosts)} ghost(s)")
                 ghosts.clear()
                 last_map_id = snap.map_id
+                consecutive_walk_failures = 0
 
             if snap.in_combat:
                 ents = snap.fight_entities
@@ -1199,6 +1364,21 @@ def main():
             # phase == idle
             near = nearest_mob(snap, ghosts, args.max_group_size)
             if near is None:
+                # nearest_mob filters mid-walk mobs (move_ends_at_ms in
+                # the future). If all visible non-ghost mobs are walking,
+                # don't mark the map empty -- they'll be click-targetable
+                # in another ~400-800ms. Just sleep and re-pick.
+                now_ms = int(time.time() * 1000)
+                walking = [
+                    (c, m) for c, m in snap.mobs.items()
+                    if (c, m.group_id) not in ghosts
+                    and (args.max_group_size <= 0 or len(m.members) <= args.max_group_size)
+                    and m.move_ends_at_ms > now_ms
+                ]
+                if walking:
+                    wait_ms = max(m.move_ends_at_ms - now_ms for _, m in walking)
+                    time.sleep(min(wait_ms / 1000.0 + 0.05, IDLE_POLL_SEC))
+                    continue
                 # No valid mob (none visible or all filtered). Mark this
                 # map empty, then try to walk to a calibrated neighbour
                 # whose target isn't itself in cooldown.
@@ -1230,10 +1410,21 @@ def main():
                     skipped = [d for d in safe if d not in fresh]
                     skip_note = (f", skipping {skipped} (target map recently empty)"
                                  if skipped else "")
-                    print(f"[fighter] phase=idle map={snap.map_id}: {reason}; "
+                    cur_world = entry.get("world")
+                    cur_world_str = (f"({cur_world[0]},{cur_world[1]})"
+                                     if cur_world else "?")
+                    delta = DIRECTION_WORLD_DELTA.get(direction)
+                    if cur_world and delta:
+                        tgt_world_str = f"({cur_world[0]+delta[0]},{cur_world[1]+delta[1]})"
+                    else:
+                        tgt_world_str = "?"
+                    tgt_mid = target_map_id(entry, direction, MAP_BY_WORLD)
+                    tgt_mid_str = str(tgt_mid) if tgt_mid is not None else "?"
+                    print(f"[fighter] phase=idle map={snap.map_id} world={cur_world_str} "
+                          f"my_cell={snap.my_cell}: {reason}; "
                           f"walking {direction} (fresh={fresh}{skip_note}, "
                           f"avoid={excluded}) to switch cell={switch_cell} "
-                          f"-> ({x},{y})")
+                          f"-> screen=({x},{y}); target map={tgt_mid_str} world={tgt_world_str}")
                     ctx.click(x, y)
                     last_walk_direction = direction
                     before_map = snap.map_id
@@ -1248,10 +1439,20 @@ def main():
                         else:
                             print(f"[fighter] map changed {before_map} -> {ns.map_id} "
                                   f"via {direction}")
+                        consecutive_walk_failures = 0
                     else:
+                        consecutive_walk_failures += 1
                         print(f"[fighter] walk to {direction} switch cell did not "
                               f"change map in {MAP_CHANGE_TIMEOUT}s; will retry "
-                              f"next tick")
+                              f"next tick (consecutive_failures={consecutive_walk_failures})")
+                        if consecutive_walk_failures >= STUCK_WARN_THRESHOLD:
+                            elapsed = consecutive_walk_failures * MAP_CHANGE_TIMEOUT
+                            print(f"[fighter] *** STUCK *** {consecutive_walk_failures} "
+                                  f"consecutive failed walks on map={snap.map_id} "
+                                  f"world={cur_world_str} (~{elapsed:.0f}s of no real "
+                                  f"movement). Dofus inactivity disconnect is ~30min. "
+                                  f"Check: switch_cell calibration, obstacles blocking "
+                                  f"path, or game-window focus.")
                     continue
                 if now - last_status_ts > STATUS_LOG_SEC:
                     total = len(snap.mobs)
@@ -1268,7 +1469,10 @@ def main():
                         nav_note = (f"safe={safe} but every target is in cooldown "
                                     f"(empty within {int(EMPTY_MAP_RESPAWN_SEC)}s); "
                                     f"waiting for respawn")
-                    print(f"[fighter] phase=idle map={snap.map_id} "
+                    cur_world = entry.get("world")
+                    cur_world_str = (f"({cur_world[0]},{cur_world[1]})"
+                                     if cur_world else "?")
+                    print(f"[fighter] phase=idle map={snap.map_id} world={cur_world_str} "
                           f"my_cell={snap.my_cell} no mobs visible "
                           f"(ghosts={len(ghosts)}){cap_note}; {nav_note}")
                     last_status_ts = now

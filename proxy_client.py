@@ -25,6 +25,12 @@ class MobGroup:
     cell: int
     group_id: int
     members: list
+    # Unix-ms deadline by which the client-side walk animation should
+    # have finished. The proxy stamps this when it sees GA0;1; for a
+    # mob; until now_ms >= move_ends_at_ms the destination cell is not
+    # yet click-targetable as an engage (Dofus treats the click as a
+    # walk). 0 = stationary, safe to click.
+    move_ends_at_ms: int = 0
 
 
 @dataclass
@@ -242,7 +248,12 @@ class ProxyState:
                 self._snap.my_life_regen_ms = ev.get("my_life_regen_ms", 0)
                 self._snap.fight_phase = ev.get("fight_phase", "idle")
                 self._snap.mobs = {
-                    m["cell"]: MobGroup(m["cell"], m["group_id"], m.get("members", []))
+                    m["cell"]: MobGroup(
+                        m["cell"],
+                        m["group_id"],
+                        m.get("members", []),
+                        m.get("move_ends_at_ms", 0),
+                    )
                     for m in ev.get("mobs") or []
                 }
                 self._snap.players = {

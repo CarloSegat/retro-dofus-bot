@@ -37,7 +37,7 @@ Deeper references:
   detection.
 - `calibrate_map_cells.py <world_x> <world_y> [N]` — per-map calibration.
   Phase 1: click N (default 2) starting cells. Phase 2: click the
-  N/E/S/W switch-map cells (press `s` to skip a direction the map
+  N/E/S/W switch-map cells (press `n` to skip a direction the map
   lacks). Phase 3: click obstacle cells, Esc when done. Writes
   `map_data/<world_x>_<world_y>.json` (cells / switch_cells / obstacles).
   Depends on `config.json.cell_calibration` being already populated.
@@ -96,6 +96,11 @@ look frozen.
   just walked (default 0.33). Without it the bow hotkey can be
   dropped mid-walk-animation -- spell-aim never arms and the
   follow-up click registers as a plain move click.
+- `sacrid_buff_enabled`: fallback default for the buff toggle if the
+  runtime prompt is skipped. `main.py` asks at startup whether to cast
+  Strength Punishment, max mob group size (default 8), and min HP
+  before engaging (default 500) — the answers override config for the
+  session.
 - `sacrid_buff_hotkey` / `sacrid_buff_ap_cost` / `sacrid_buff_max_dist`
   / `sacrid_buff_cooldown_turns`: Strength Punishment self-buff slot,
   AP cost, max Po distance at which the buff is worth casting, and the

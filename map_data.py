@@ -54,6 +54,33 @@ def load_all():
     return out
 
 
+def file_path_for(entry):
+    """Path to the on-disk JSON file for a map_data entry, derived from
+    its world coords. Returns None if `entry` has no usable world field."""
+    world = entry.get("world")
+    if not (isinstance(world, (list, tuple)) and len(world) == 2):
+        return None
+    return MAP_DATA_DIR / f"{int(world[0])}_{int(world[1])}.json"
+
+
+def save(entry):
+    """Write `entry` back to its world-derived JSON file. No-op if the
+    world field is missing. Preserves the same field order calibration
+    writes (world, map_id, cells, switch_cells, obstacles, saved_at)."""
+    path = file_path_for(entry)
+    if path is None:
+        return False
+    ordered = {k: entry[k] for k in
+               ("world", "map_id", "cells", "switch_cells",
+                "obstacles", "saved_at")
+               if k in entry}
+    for k, v in entry.items():
+        if k not in ordered:
+            ordered[k] = v
+    path.write_text(json.dumps(ordered, indent=2))
+    return True
+
+
 def build_world_index(map_data):
     """{(world_x, world_y): entry} for every entry with a valid world field."""
     out = {}

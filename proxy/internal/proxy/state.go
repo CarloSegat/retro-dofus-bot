@@ -134,11 +134,26 @@ type stateTracker struct {
 }
 
 // MobGroup is one aggressive monster pack sitting on a cell.
+//
+// MoveEndsAtMs is the unix-ms deadline by which the client-side walk
+// animation for the most recent GA0;1; / GA;1; movement should have
+// finished. The wire packet announces the *destination* immediately, so
+// our Cell field jumps ahead by ~steps*mobStepWalkMs of where the
+// sprite actually is. Clicking the destination during that window
+// registers as a walk, not an engage -- consumers should skip mobs
+// whose MoveEndsAtMs is in the future.
 type MobGroup struct {
-	Cell    int   `json:"cell"`
-	GroupID int   `json:"group_id"`
-	Members []int `json:"members"`
+	Cell          int   `json:"cell"`
+	GroupID       int   `json:"group_id"`
+	Members       []int `json:"members"`
+	MoveEndsAtMs  int64 `json:"move_ends_at_ms"`
 }
+
+// Per-cell walk duration used to estimate when a mob's GA0;1; animation
+// finishes. 400ms is a deliberate over-estimate: shorter than the run
+// animation would let the bot click during the tail of the animation
+// (where engage still fails), longer would just delay one tick.
+const mobStepWalkMs = 400
 
 type Player struct {
 	ID   int    `json:"id"`
@@ -272,16 +287,25 @@ func (s *stateTracker) applyMovement(body string) {
 			}
 		}
 	} else if actorID < 0 {
-		// Mob group movement. Find current cell by group_id and re-key.
+		// Mob group movement. Find current cell by group_id and re-key,
+		// and stamp the estimated animation-end time so consumers don't
+		// click the destination cell before the sprite arrives.
 		for cell, mob := range s.mobs {
 			if mob.GroupID == actorID {
+				steps := cellDistance(cell, dest)
+				if steps < 1 {
+					steps = 1
+				}
+				mob.MoveEndsAtMs = time.Now().UnixMilli() + int64(steps)*mobStepWalkMs
 				if cell != dest {
 					delete(s.mobs, cell)
 					mob.Cell = dest
 					s.mobs[dest] = mob
-					log.Printf("[state] mob group=%d cell %d -> %d (path %q)", actorID, cell, dest, parts[1])
-					changed = true
+					log.Printf("[state] mob group=%d cell %d -> %d steps=%d (path %q)", actorID, cell, dest, steps, parts[1])
+				} else {
+					s.mobs[cell] = mob
 				}
+				changed = true
 				break
 			}
 		}
