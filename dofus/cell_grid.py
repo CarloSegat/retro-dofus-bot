@@ -47,6 +47,14 @@ def cell_to_xy(cell, origin_x, origin_y, cell_w, cell_h):
     return int(round(x)), int(round(y))
 
 
+def cell_to_screen(cell, cal):
+    """Center pixel (x, y) of cell_id using a calibration dict
+    (origin_x, origin_y, cell_w, cell_h fields). Convenience wrapper
+    around cell_to_xy for callers that have a cal dict in hand."""
+    return cell_to_xy(cell, cal["origin_x"], cal["origin_y"],
+                      cal["cell_w"], cal["cell_h"])
+
+
 def xy_to_cell(x, y, origin_x, origin_y, cell_w, cell_h, max_sub_row=42):
     """Inverse of cell_to_xy. Returns (cell_id, residual_px) -- the cell
     whose center is closest to (x, y) under the given calibration. The

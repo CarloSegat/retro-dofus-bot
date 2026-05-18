@@ -36,8 +36,8 @@ from types import SimpleNamespace
 
 import mss
 
-from dofus.cell_grid import a_star, cell_distance, cell_to_xy, line_of_sight, neighbors, on_map
-from fight import pass_turn
+from dofus.actions import cast_at_cell, pass_turn, sit
+from dofus.cell_grid import a_star, cell_distance, cell_to_screen, line_of_sight, neighbors, on_map
 from dofus.map_data import (
     DIRECTION_WORLD_DELTA,
     OPPOSITE_DIRECTION,
@@ -47,7 +47,7 @@ from dofus.map_data import (
     save as save_map_data,
     target_map_id,
 )
-from mouse_keyboard import click_at, click_at_focused, press, press_focused, type_text_focused
+from mouse_keyboard import click_at, press_focused
 from dofus.proxy_client import ProxyState
 from utils import CFG, make_ctx
 from vision import ensure_safe_to_resume
@@ -90,6 +90,8 @@ BUFF_MAX_DIST = int(CFG.get("sacrid_buff_max_dist", 6))
 # as soon as it's available (assuming the distance gate also passes).
 BUFF_COOLDOWN_TURNS = int(CFG.get("sacrid_buff_cooldown_turns", 5))
 CAST_WAIT_SEC = float(CFG.get("sacrid_cast_wait_sec", 0.8))
+PASS_TURN_HOTKEY = CFG.get("pass_turn_hotkey", "e")
+PASS_TURN_PRE_DELAY_SEC = float(CFG.get("pass_turn_pre_delay_sec", 1.5))
 WALK_WAIT_SEC = float(CFG.get("sacrid_walk_wait_sec", 2.0))
 WALK_STEP_WAIT_SEC = float(CFG.get("sacrid_walk_step_wait_sec", 1.0))
 # Shorter per-click movement-wait for the post-Dissolution follow-up
@@ -172,10 +174,6 @@ def load_cal():
         print("missing cell_calibration in config.json.")
         sys.exit(1)
     return cal
-
-
-def cell_to_screen(cell, cal):
-    return cell_to_xy(cell, cal["origin_x"], cal["origin_y"], cal["cell_w"], cal["cell_h"])
 
 
 def wait_for(state, predicate, timeout, poll=0.2):
@@ -279,11 +277,7 @@ def sit_for_regen(state):
     wait_for_hp invokes us we're known standing. Cleared automatically
     on fight_engage."""
     print("[fighter] /sit to regen faster")
-    press_focused("Return")
-    time.sleep(0.3)
-    type_text_focused("/sit")
-    time.sleep(0.3)
-    press_focused("Return")
+    sit()
     state.set_sitting(True)
 
 
@@ -598,39 +592,21 @@ def prune_obstacles_from_entities(map_id, snap):
 
 
 def cast_dissolution(my_cell, cal):
-    """Press Dissolution hotkey, then click own cell (self-cast AoE that
-    damages the 4 edge-adjacent cells).
-
-    Uses `spell_click` (xdotool) rather than the plain pyautogui click:
-    in spell-aim mode pyautogui's click is silently dropped sometimes,
-    leaving the spell armed without firing -- bot then passes the turn
-    with full AP. See CLAUDE.md."""
-    x, y = cell_to_screen(my_cell, cal)
-    print(f"  CAST Dissolution hotkey={DISSOLUTION_HOTKEY!r} self_cell={my_cell} -> ({x},{y})")
-    press(DISSOLUTION_HOTKEY)
-    time.sleep(0.4)  # let Dofus enter spell-aim mode and show the reticle
-    click_at_focused(x, y)
+    """Self-cast AoE: damages the 4 edge-adjacent cells."""
+    print(f"  CAST Dissolution hotkey={DISSOLUTION_HOTKEY!r} self_cell={my_cell}")
+    cast_at_cell(DISSOLUTION_HOTKEY, my_cell, cal)
 
 
 def cast_strength_punishment(my_cell, cal):
-    """Press Strength Punishment hotkey, then click own cell (self-buff).
-
-    Same spell-aim-mode click rule as `cast_dissolution`."""
-    x, y = cell_to_screen(my_cell, cal)
-    print(f"  CAST Strength Punishment hotkey={BUFF_HOTKEY!r} self_cell={my_cell} -> ({x},{y})")
-    press(BUFF_HOTKEY)
-    time.sleep(0.4)
-    click_at_focused(x, y)
+    """Self-buff: press hotkey, click own cell."""
+    print(f"  CAST Strength Punishment hotkey={BUFF_HOTKEY!r} self_cell={my_cell}")
+    cast_at_cell(BUFF_HOTKEY, my_cell, cal)
 
 
 def cast_bow(target_cell, cal):
-    """Press bow hotkey, then click an enemy cell. Same spell-aim click
-    contract as the Sacrieur spells -- xdotool, not pyautogui."""
-    x, y = cell_to_screen(target_cell, cal)
-    print(f"  CAST Bow hotkey={BOW_HOTKEY!r} target_cell={target_cell} -> ({x},{y})")
-    press(BOW_HOTKEY)
-    time.sleep(0.4)
-    click_at_focused(x, y)
+    """Aimed weapon shot at an enemy cell in [BOW_MIN_RANGE, BOW_MAX_RANGE]."""
+    print(f"  CAST Bow hotkey={BOW_HOTKEY!r} target_cell={target_cell}")
+    cast_at_cell(BOW_HOTKEY, target_cell, cal)
 
 
 def pick_bow_target(snap, me_cell, static_obstacles, debug=False):
@@ -1018,7 +994,7 @@ def run_combat_sacrid(ctx, state, cal):
         enemies = alive_enemies(snap)
         if not enemies:
             print("  no alive enemies in snapshot; passing")
-            pass_turn(ctx)
+            pass_turn(PASS_TURN_HOTKEY, PASS_TURN_PRE_DELAY_SEC)
             continue
 
         # Sample turn-start distance for tofu detection. Must happen
@@ -1171,7 +1147,7 @@ def run_combat_sacrid(ctx, state, cal):
                 if not state.snapshot().in_combat:
                     return
                 print("  PASS (pass-turn hotkey)")
-                pass_turn(ctx)
+                pass_turn(PASS_TURN_HOTKEY, PASS_TURN_PRE_DELAY_SEC)
                 continue
 
         # Buff with cooldown: cast on turn T, recast at turn T + cooldown.
@@ -1282,7 +1258,7 @@ def run_combat_sacrid(ctx, state, cal):
         if not state.snapshot().in_combat:
             return
         print("  PASS (pass-turn hotkey)")
-        pass_turn(ctx)
+        pass_turn(PASS_TURN_HOTKEY, PASS_TURN_PRE_DELAY_SEC)
 
 
 def _prompt_int(label, default):
@@ -1451,7 +1427,7 @@ def main():
                 if snap.last_fight_engage_ts != placed_for_engage_ts:
                     place_starting_cells(snap, cal)
                     placed_for_engage_ts = snap.last_fight_engage_ts
-                pass_turn(ctx)
+                pass_turn(PASS_TURN_HOTKEY, PASS_TURN_PRE_DELAY_SEC)
                 if not wait_for(state, lambda s: s.in_combat or not s.in_fight,
                                 COMBAT_START_TIMEOUT):
                     print(f"[fighter] still in placement after {COMBAT_START_TIMEOUT}s; "
@@ -1522,7 +1498,7 @@ def main():
                           f"walking {direction} (fresh={fresh}{skip_note}, "
                           f"avoid={excluded}) to switch cell={switch_cell} "
                           f"-> screen=({x},{y}); target map={tgt_mid_str} world={tgt_world_str}")
-                    ctx.click_at(x, y)
+                    ctx.click(x, y)
                     last_walk_direction = direction
                     before_map = snap.map_id
                     if wait_for(state,
@@ -1595,7 +1571,7 @@ def main():
             print(f"[fighter] engaging nearest mob: cell={cell} dist={d} "
                   f"group={mob.group_id} members={mob.members} "
                   f"hp~{hp_snap.estimated_life()}/{hp_snap.my_life_max} -> screen=({x},{y})")
-            ctx.click_at(x, y)
+            ctx.click(x, y)
             if wait_for(state, lambda s: s.in_fight, ENGAGE_TIMEOUT):
                 print(f"[fighter] fight_engage received (phase={state.snapshot().fight_phase})")
                 continue
@@ -1616,7 +1592,7 @@ def main():
             print(f"[fighter] nearest didn't engage; trying next-nearest mob: "
                   f"cell={acell} dist={d2} group={amob.group_id} "
                   f"members={amob.members} -> screen=({ax},{ay})")
-            ctx.click_at(ax, ay)
+            ctx.click(ax, ay)
             if wait_for(state, lambda s: s.in_fight, ENGAGE_TIMEOUT):
                 print(f"[fighter] fight_engage received (phase={state.snapshot().fight_phase})")
             else:
