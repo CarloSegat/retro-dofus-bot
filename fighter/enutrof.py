@@ -10,8 +10,8 @@ so we don't pile multiple hits on a target that may have died on the
 first hit -- the proxy only updates `alive`/`hp` on GTM packets which
 fire at turn boundaries, so mid-turn there's no kill signal.
 
-Walking helpers (walk_toward, etc.) live in fighter.sacrieur and are
-class-agnostic; we import them rather than duplicate.
+Walking helpers (walk_toward, etc.) live in fighter.walking — shared
+with Sacrieur.
 
 Wired via Combat.on_turn_start(enutrof.play_turn) and
 Combat.on_fight_engaged(enutrof.on_fight_engaged) in Orchestrator.
@@ -22,7 +22,7 @@ from dofus.actions import cast_at_cell, pass_turn
 from dofus.cell_grid import cell_distance, line_of_sight
 from dofus.map_data import save as save_map_data
 from fighter.helpers import alive_enemies, my_fight_cell
-from fighter.sacrieur import walk_toward
+from fighter.walking import walk_toward
 from utils import CFG
 
 
