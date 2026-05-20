@@ -6,6 +6,20 @@ the `berlinthree` Ankama account. Reads the game's TCP stream as "eyes"
 so the bot engages mobs by *cell id* instead of color-matching the
 screen.
 
+Two character profiles are supported, picked at startup via the
+"character class" prompt (`sacrieur` / `enutrof`, default `sacrieur`):
+- **Sacrieur** (`fighter/sacrieur.py`): the full brain — Dissolution
+  AoE, Bold Punishment buff, Vital Punishment filler, Swap, Attraction,
+  tofu-retreat mode. The original profile.
+- **Enutrof** (`fighter/enutrof.py`): single-spell brain — Coins
+  Throwing only. Walks into range/LoS if needed, spams Coins until AP
+  runs out, passes. 2 AP per cast, 13 range. No buffs, no retreat
+  logic.
+
+Both profiles share the same engager/navigator/regen/inventory pipeline
+and the same combat-callback contract (`on_fight_engaged(snap)`,
+`play_turn(ctx)`).
+
 ## Architecture
 
 The Dofus Retro Linux client is `dofus1electron` — a native x86-64 ELF
@@ -193,6 +207,21 @@ look frozen.
   (default 0.33). Same drop mechanism as Dissolution.
 - `sacrid_cast_wait_sec`: pause after each cast so the proxy `GTM`
   update with the new AP/HP arrives (default 0.8).
+- `enutrof_coins_hotkey`: spell slot for Coins Throwing, default `"1"`.
+  **Required** when running the Enutrof profile — Orchestrator refuses
+  to start if empty. Coins Throwing is the only spell the Enutrof brain
+  uses: ranged single-target, 2 AP per cast, range 1..13. The bot
+  walks toward the nearest enemy only if it isn't already in range
+  with LoS, then casts as many times as `my_ap` allows.
+- `enutrof_coins_ap_cost`: AP per Coins Throwing cast (default 2).
+- `enutrof_coins_min_range` / `enutrof_coins_max_range`: Po-distance
+  window for Coins Throwing targeting (defaults 1..13).
+- `enutrof_coins_post_walk_settle_sec`: extra sleep ADDED to
+  `pending_settle` before the Coins hotkey press when we just walked
+  (default 0.33). Same `[[post-walk-hotkey-drop]]` mechanism as the
+  Sacrieur spells.
+- `enutrof_cast_wait_sec`: pause after each Coins cast for the proxy
+  `GTM` update to arrive (default 0.8).
 - `sacrid_walk_wait_sec`: max wait for `my_cell` to settle after a
   walk click (default 2.0).
 - `empty_map_respawn_sec`: cooldown before the navigator will walk

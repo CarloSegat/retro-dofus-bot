@@ -34,6 +34,11 @@ from fighter.helpers import (
     prompt_yn,
     wait_for,
 )
+from fighter.enutrof import (
+    COINS_AP_COST,
+    COINS_HOTKEY,
+    Enutrof,
+)
 from fighter.navigator import MapNavigator
 from fighter.regen import HpRegen
 from fighter.sacrieur import (
@@ -49,12 +54,34 @@ from fighter.sacrieur import (
 from utils import CFG, make_ctx
 
 
+CLASS_SACRIEUR = "sacrieur"
+CLASS_ENUTROF = "enutrof"
+
+
+def prompt_character_class():
+    """Ask which character profile to play. Defaults to Sacrieur."""
+    default = (CFG.get("character_class") or CLASS_SACRIEUR).lower()
+    while True:
+        raw = input(f"  character class [sacrieur/enutrof, default {default}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in (CLASS_SACRIEUR, "s", "sacri", "sac"):
+            return CLASS_SACRIEUR
+        if raw in (CLASS_ENUTROF, "e", "enu"):
+            return CLASS_ENUTROF
+        print(f"  unknown class {raw!r}; type 'sacrieur' or 'enutrof'")
+
+
 def prompt_runtime_settings():
     """Interactive startup questions. Returns SimpleNamespace with
-    buff_enabled, max_group_size, min_hp."""
+    character_class, buff_enabled (Sacrieur only), max_group_size, min_hp."""
     print("[fighter] runtime settings (Enter for default):")
-    buff_enabled = prompt_yn("  cast Bold Punishment buff?",
-                             default=bool(CFG.get("sacrid_buff_enabled", True)))
+    character_class = prompt_character_class()
+    if character_class == CLASS_SACRIEUR:
+        buff_enabled = prompt_yn("  cast Bold Punishment buff?",
+                                 default=bool(CFG.get("sacrid_buff_enabled", True)))
+    else:
+        buff_enabled = False  # unused for non-Sacrieur classes
     max_group_size = prompt_int(
         "  max mob group size to engage (0 = no cap)",
         default=int(CFG.get("max_mob_group_size", 8)))
@@ -62,6 +89,7 @@ def prompt_runtime_settings():
         "  min HP before engaging",
         default=int(CFG.get("min_hp_to_engage", 500)))
     return SimpleNamespace(
+        character_class=character_class,
         buff_enabled=buff_enabled,
         max_group_size=max_group_size,
         min_hp=min_hp,
@@ -73,12 +101,15 @@ class Orchestrator:
     in __init__; run() is the state machine loop."""
 
     def __init__(self):
-        if not DISSOLUTION_HOTKEY:
+        self.args = prompt_runtime_settings()
+        if self.args.character_class == CLASS_SACRIEUR and not DISSOLUTION_HOTKEY:
             print("config.json is missing 'sacrid_dissolution_hotkey'. Set it to "
                   "the key Dissolution is bound to (e.g. \"2\").")
             sys.exit(1)
-
-        self.args = prompt_runtime_settings()
+        if self.args.character_class == CLASS_ENUTROF and not COINS_HOTKEY:
+            print("config.json is missing 'enutrof_coins_hotkey'. Set it to "
+                  "the key Coins Throwing is bound to (e.g. \"1\").")
+            sys.exit(1)
         self.cal = load_cal()
         self.map_data = load_map_data()
         self.map_by_world = build_world_index(self.map_data)
@@ -101,8 +132,11 @@ class Orchestrator:
         self._ctx = make_ctx(self._sct)
 
         # --- Construct the classes ---
-        self.sacrieur = Sacrieur(self.state, self.cal, self.map_data,
-                                 buff_enabled=self.args.buff_enabled)
+        if self.args.character_class == CLASS_SACRIEUR:
+            self.fighter = Sacrieur(self.state, self.cal, self.map_data,
+                                    buff_enabled=self.args.buff_enabled)
+        else:
+            self.fighter = Enutrof(self.state, self.cal, self.map_data)
         self.hp_regen = HpRegen(self.state, min_hp=self.args.min_hp)
         self.inventory = Inventory(self.state)
         self.engager = Engager(self.state, self.cal, self.hp_regen,
@@ -113,9 +147,9 @@ class Orchestrator:
         self.combat = Combat(self.state, self._ctx)
 
         # --- Wire callbacks (single source of truth) ---
-        self.combat.on_fight_engaged(self.sacrieur.on_fight_engaged)
+        self.combat.on_fight_engaged(self.fighter.on_fight_engaged)
         self.combat.on_fight_engaged(self.hp_regen.on_fight_engaged)
-        self.combat.on_turn_start(self.sacrieur.play_turn)
+        self.combat.on_turn_start(self.fighter.play_turn)
         self.combat.on_turn_start(self._log_turn)
         self.combat.on_turn_end(self._log_turn_end)
         self.combat.on_fight_ended(self.inventory.on_fight_ended)
@@ -129,9 +163,14 @@ class Orchestrator:
         print(f"[fighter] cal: origin=({self.cal['origin_x']:.1f},"
               f"{self.cal['origin_y']:.1f}) "
               f"cell={self.cal['cell_w']:.2f}x{self.cal['cell_h']:.2f}")
-        print(f"[fighter] dissolution_hotkey={DISSOLUTION_HOTKEY!r} "
-              f"ap_cost={DISSOLUTION_AP_COST}")
-        print(f"[fighter] buff: {'enabled' if self.args.buff_enabled else 'DISABLED'}")
+        print(f"[fighter] character_class={self.args.character_class}")
+        if self.args.character_class == CLASS_SACRIEUR:
+            print(f"[fighter] dissolution_hotkey={DISSOLUTION_HOTKEY!r} "
+                  f"ap_cost={DISSOLUTION_AP_COST}")
+            print(f"[fighter] buff: {'enabled' if self.args.buff_enabled else 'DISABLED'}")
+        else:
+            print(f"[fighter] coins_hotkey={COINS_HOTKEY!r} "
+                  f"ap_cost={COINS_AP_COST}")
         print(f"[fighter] min-hp threshold: wait until >= {self.args.min_hp} HP "
               f"before engaging")
         if self.args.max_group_size > 0:
