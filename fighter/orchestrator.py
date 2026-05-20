@@ -12,6 +12,7 @@ delegate to the right class:
 All class-to-class subscriptions happen in __init__. To understand who
 reacts to what, you read that block.
 """
+import os
 import sys
 import time
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from types import SimpleNamespace
 import mss
 
 from dofus.actions import pass_turn
+from dofus.inventory import Inventory
 from dofus.map_data import build_world_index, load_all as load_map_data
 from dofus.proxy_client import ProxyState
 from fighter.combat import Combat, TurnContext  # noqa: F401 (re-exported)
@@ -41,6 +43,9 @@ from fighter.sacrieur import (
     PASS_TURN_PRE_DELAY_SEC,
     Sacrieur,
 )
+# fighter.weapon.Weapon is intentionally not wired anymore -- the bow has
+# been replaced by Attraction (line-only ranged pull). The Weapon class
+# is kept on disk for potential future re-use.
 from utils import CFG, make_ctx
 
 
@@ -48,7 +53,7 @@ def prompt_runtime_settings():
     """Interactive startup questions. Returns SimpleNamespace with
     buff_enabled, max_group_size, min_hp."""
     print("[fighter] runtime settings (Enter for default):")
-    buff_enabled = prompt_yn("  cast Strength Punishment buff?",
+    buff_enabled = prompt_yn("  cast Bold Punishment buff?",
                              default=bool(CFG.get("sacrid_buff_enabled", True)))
     max_group_size = prompt_int(
         "  max mob group size to engage (0 = no cap)",
@@ -92,15 +97,16 @@ class Orchestrator:
         print(f"[fighter] ready: my_id={snap.my_id} my_cell={snap.my_cell} "
               f"map={snap.map_id}")
 
-        self._sct = mss.mss()
+        self._sct = mss.mss(backend=os.environ.get("MSS_BACKEND", "default"))
         self._ctx = make_ctx(self._sct)
 
         # --- Construct the classes ---
         self.sacrieur = Sacrieur(self.state, self.cal, self.map_data,
                                  buff_enabled=self.args.buff_enabled)
         self.hp_regen = HpRegen(self.state, min_hp=self.args.min_hp)
+        self.inventory = Inventory(self.state)
         self.engager = Engager(self.state, self.cal, self.hp_regen,
-                               self.map_data,
+                               self.map_data, self.inventory,
                                max_group_size=self.args.max_group_size)
         self.navigator = MapNavigator(self.state, self.cal, self.map_data,
                                       self.map_by_world, self.engager)
@@ -112,6 +118,7 @@ class Orchestrator:
         self.combat.on_turn_start(self.sacrieur.play_turn)
         self.combat.on_turn_start(self._log_turn)
         self.combat.on_turn_end(self._log_turn_end)
+        self.combat.on_fight_ended(self.inventory.on_fight_ended)
         self.combat.on_fight_ended(self._on_fight_ended)
 
         # Orchestrator-level state

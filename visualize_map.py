@@ -11,7 +11,6 @@ Use this to sanity-check calibration -- if obstacles look like a ring
 around the playable area, mob-spawn cells got mis-clicked.
 """
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -26,6 +25,7 @@ from dofus.cell_grid import (
     cell_to_subrow_pos,
     on_map,
 )
+from dofus.map_data import build_world_index, load_all as load_map_data
 
 
 CELL_W = 60
@@ -83,10 +83,10 @@ def find_font(size):
 
 
 def render(world_x, world_y, out_path):
-    data_path = Path("map_data") / f"{world_x}_{world_y}.json"
-    if not data_path.exists():
-        sys.exit(f"no calibration file: {data_path}")
-    data = json.loads(data_path.read_text())
+    by_world = build_world_index(load_map_data())
+    data = by_world.get((world_x, world_y))
+    if not data:
+        sys.exit(f"no calibration in DB for world ({world_x},{world_y})")
     obstacles = set(data.get("obstacles") or [])
     start_cells = set(data.get("cells") or [])
     switch_cells = data.get("switch_cells") or {}

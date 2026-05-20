@@ -49,12 +49,19 @@ def my_fight_cell(snap):
 
 
 def alive_enemies(snap):
-    """Alive enemies in current fight, sorted by Po distance from us."""
+    """Alive enemies in current fight, sorted by Po distance from us.
+
+    Summons are de-prioritised: if any non-summon alive enemy exists,
+    summons are filtered out so we don't waste turns on transient
+    minions. When only summons remain (real mobs all dead) they come
+    back as the targetable set."""
     me_cell = my_fight_cell(snap)
-    enemies = [
+    alive = [
         e for e in snap.fight_entities.values()
         if e.alive and e.id != snap.my_id and e.cell > 0
     ]
+    real = [e for e in alive if not e.is_summon]
+    enemies = real if real else alive
     enemies.sort(key=lambda e: cell_distance(me_cell, e.cell) if me_cell else 0)
     return enemies
 

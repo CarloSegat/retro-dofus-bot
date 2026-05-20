@@ -3,6 +3,7 @@
 Pre-reqs:
   - Go proxy running on 127.0.0.1:9999 with map_id populated.
   - config.json has cell_calibration.
+  - The map_data Postgres DB is reachable.
 
 Usage:
     python3 calibrate_paths.py <world_x> <world_y>
@@ -13,12 +14,12 @@ Flow:
   N/E/S/W switch; once the proxy reports a new map_id, the script
   follows the inferred direction (W:x-1, E:x+1, N:y-1, S:y+1) to
   figure out which world coords you've arrived at, and keeps going.
-  Press Esc when done. All touched maps get a file written in
-  map_data/.
+  Press Esc when done. All touched maps get upserted into the DB.
 
-  Existing per-map files preserve `cells` and `obstacles`. The script
-  refuses to start if the proxy's current map_id is already pinned to
-  a different world by another file (catches wrong starting coords).
+  Existing rows preserve `cells` and `obstacles` (only switch_cells
+  is rewritten per modified map). The script refuses to start if the
+  proxy's current map_id is already pinned to a different world by
+  existing DB rows (catches wrong starting coords).
 """
 import argparse
 import json
@@ -30,10 +31,10 @@ from pathlib import Path
 from pynput import keyboard, mouse
 
 from dofus.cell_grid import cell_to_uv, xy_to_cell
+from dofus.map_data import load_all as load_map_data, save as save_map_data
 from dofus.proxy_client import ProxyState
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
-MAP_DATA_DIR = Path(__file__).with_name("map_data")
 PROXY_ADDR = "127.0.0.1:9999"
 
 # Canvas centre in iso (u, v) coords. See infer_direction.
@@ -47,12 +48,6 @@ DIR_DELTA = {
     "south": (0, 1),
 }
 
-# A click on a switch cell triggers a GDM packet shortly after. If
-# nothing arrives within this window, treat the click as a non-switch
-# (clicked an obstacle, a regular floor, etc) and discard.
-PENDING_TRANSITION_TIMEOUT_SEC = 2.5
-
-
 def infer_direction(cell):
     """(direction, margin) — see original implementation. margin <= 1
     means the click sits on a NE/SE/SW/NW diagonal and the call is
@@ -65,13 +60,6 @@ def infer_direction(cell):
     else:
         direction = "south" if da > 0 else "north"
     return direction, abs(abs(da) - abs(db))
-
-
-def load_existing(path: Path):
-    try:
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
 
 
 def main():
@@ -107,39 +95,39 @@ def main():
               "proxy already running.")
         sys.exit(1)
 
-    # Build lookup map_id -> (world_x, world_y) from existing files so
-    # we can name maps in logs and detect conflicts when we infer new
-    # world coords during the walk.
-    map_id_to_world: dict[int, tuple[int, int]] = {}
-    for f in MAP_DATA_DIR.glob("*.json"):
-        d = load_existing(f)
-        if not d:
-            continue
-        mid = d.get("map_id")
-        w = d.get("world")
-        if isinstance(mid, int) and isinstance(w, list) and len(w) == 2:
-            map_id_to_world[mid] = (w[0], w[1])
+    # Single read of every calibrated map from the DB. We mutate the
+    # in-memory entries during the walk; `modified` flags gate which
+    # ones get save()'d at the end.
+    try:
+        db_entries = load_map_data()
+    except Exception as exc:
+        print(f"[calibrate-paths] could not query map_data DB: {exc}")
+        state.stop()
+        sys.exit(1)
 
-    # Per-map data we'll write back at the end. Lazy-loaded on first
-    # touch, then mutated in memory. `modified` is the flag that gates
-    # the file write -- maps we only walked through but never recorded
-    # a switch for are left alone.
-    cache: dict[tuple[int, int], dict] = {}
+    by_world: dict[tuple[int, int], dict] = {}
+    map_id_to_world: dict[int, tuple[int, int]] = {}
+    for entry in db_entries.values():
+        w = entry.get("world")
+        mid = entry.get("map_id")
+        if isinstance(mid, int) and isinstance(w, list) and len(w) == 2:
+            key = (int(w[0]), int(w[1]))
+            entry["modified"] = False
+            by_world[key] = entry
+            map_id_to_world[mid] = key
 
     def get_data(world: tuple[int, int]) -> dict:
-        if world in cache:
-            return cache[world]
-        path = MAP_DATA_DIR / f"{world[0]}_{world[1]}.json"
-        existing = load_existing(path) or {}
-        cache[world] = {
+        if world in by_world:
+            return by_world[world]
+        by_world[world] = {
             "world": list(world),
-            "map_id": existing.get("map_id"),
-            "cells": list(existing.get("cells") or []),
-            "switch_cells": dict(existing.get("switch_cells") or {}),
-            "obstacles": sorted(set(existing.get("obstacles") or [])),
+            "map_id": None,
+            "cells": [],
+            "switch_cells": {},
+            "obstacles": [],
             "modified": False,
         }
-        return cache[world]
+        return by_world[world]
 
     cur_map_id = snap.map_id
     cur_world = start_world
@@ -253,53 +241,61 @@ def main():
         st["pending"] = None
 
     def save_all():
-        MAP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
         saved = []
-        for world, d in cache.items():
+        for world, d in by_world.items():
             if not d.get("modified"):
                 continue
-            path = MAP_DATA_DIR / f"{world[0]}_{world[1]}.json"
+            # Only switch_cells changes during this script -- keep the
+            # save call narrow so we don't clobber resources/pois the
+            # user may have recorded out-of-band.
             out = {
                 "world": list(world),
                 "map_id": d["map_id"],
-                "cells": list(d["cells"]),
                 "switch_cells": d["switch_cells"],
-                "obstacles": sorted(set(d["obstacles"])),
-                "saved_at": ts,
             }
-            path.write_text(json.dumps(out, indent=2))
+            save_map_data(out)
             saved.append((world, len(d["switch_cells"])))
         return saved
 
     try:
         while not stop["flag"]:
             snap = state.snapshot()
-            if st["pending"] is not None:
-                if snap.map_id and snap.map_id != st["pending"]["src_map_id"]:
-                    commit_pending(snap.map_id)
-                elif time.time() - st["pending"]["ts"] > PENDING_TRANSITION_TIMEOUT_SEC:
-                    p = st["pending"]
-                    print(f"    cell={p['cell']} ({p['direction']}) didn't "
-                          f"trigger a map change; discarding.")
-                    st["pending"] = None
+            # Proxy reports a new map -> commit pending click with the
+            # new map_id as the destination.
+            if (st["pending"] is not None
+                    and snap.map_id
+                    and snap.map_id != st["pending"]["src_map_id"]):
+                commit_pending(snap.map_id)
 
             try:
                 x, y, click_map_id = click_q.get(timeout=0.2)
             except queue.Empty:
                 continue
 
-            if st["pending"] is not None:
-                print("    previous click still pending a transition; "
-                      "this click ignored.")
-                continue
+            # Click was captured on a different map than the one we
+            # track as current -> the transition happened but we
+            # missed it in the snap poll. Use the click's map_id to
+            # commit the pending direction, then fall through to
+            # treat this click as a fresh action on the new map.
+            if click_map_id and click_map_id != st["cur_map_id"]:
+                if st["pending"] is not None:
+                    commit_pending(click_map_id)
+                else:
+                    print(f"    click on {fmt_map(click_map_id)} but no "
+                          f"pending direction from "
+                          f"{fmt_map(st['cur_map_id'])} — can't infer "
+                          f"world; click ignored.")
+                    continue
 
-            if click_map_id != st["cur_map_id"]:
-                # Click landed during/after a transition we already
-                # processed. Skip rather than misattribute.
-                print(f"    click on {fmt_map(click_map_id)} ignored "
-                      f"(currently on {fmt_map(st['cur_map_id'])}).")
-                continue
+            # If a pending is still around at this point, the previous
+            # click was on the same map as this one and didn't trigger
+            # a transition (otherwise commit_pending above would have
+            # cleared it). Treat it as a non-switch click and drop it.
+            if st["pending"] is not None:
+                p = st["pending"]
+                print(f"    previous cell={p['cell']} ({p['direction']}) "
+                      f"didn't trigger a map change; replacing.")
+                st["pending"] = None
 
             cell, residual = xy_to_cell(
                 x, y,

@@ -13,6 +13,7 @@ from dofus.actions import click_cell
 from dofus.map_data import (
     DIRECTION_WORLD_DELTA,
     OPPOSITE_DIRECTION,
+    find_path,
     safe_directions,
     target_map_id,
 )
@@ -148,6 +149,115 @@ class MapNavigator:
                       f"Check: switch_cell calibration, obstacles blocking "
                       f"path, or game-window focus.")
         return True
+
+    def walk_to_world(self, target_world, on_aggro=None):
+        """Walk from the current map to the calibrated map at
+        `target_world` (a (world_x, world_y) tuple).
+
+        Returns True iff the bot is standing on the target map at the
+        end. Returns False if:
+          - the current map isn't calibrated (can't anchor pathfinding)
+          - no path exists in the calibrated graph (fails *upfront* --
+            no clicks issued)
+          - a walk step doesn't change the map within MAP_CHANGE_TIMEOUT
+          - we aggro AND `on_aggro` is None
+          - after running `on_aggro`, we land on an un-calibrated map
+
+        Aggro handling: if `on_aggro` is provided, it's called when a
+        switch-cell click triggers a fight (expected to block until
+        the fight resolves). After it returns, we re-pathfind from
+        wherever we ended up -- the fight or its post-fight cleanup
+        may have left us on the same map or a neighbour. `on_aggro`
+        is typically `Combat.run`.
+        """
+        target = (int(target_world[0]), int(target_world[1]))
+        while True:
+            snap = self.state.snapshot()
+            entry = self.map_data.get(snap.map_id)
+            if entry is None:
+                print(f"[walk_to] current map_id={snap.map_id} is not "
+                      f"calibrated; can't anchor pathfinding")
+                return False
+            world = entry.get("world")
+            if not (isinstance(world, (list, tuple)) and len(world) == 2):
+                print(f"[walk_to] current map {snap.map_id} has no world "
+                      f"field in map_data; aborting")
+                return False
+            cur = (int(world[0]), int(world[1]))
+            if cur == target:
+                print(f"[walk_to] arrived at world {target} "
+                      f"(map_id={snap.map_id})")
+                return True
+            path = find_path(cur, target, self.map_by_world)
+            if path is None:
+                print(f"[walk_to] no calibrated path from world {cur} to "
+                      f"{target}; aborting (run nav_graph.py to inspect "
+                      f"missing edges)")
+                return False
+            print(f"[walk_to] world {cur} -> {target}: {len(path)} step(s) "
+                  f"via {path}")
+            direction = path[0]
+            stepped, fought = self._walk_one_step(entry, direction, on_aggro)
+            if fought:
+                # Re-pathfind from the new map (fight may have ended on
+                # a neighbour, or the post-fight cleanup might have left
+                # the character somewhere unexpected).
+                continue
+            if not stepped:
+                print(f"[walk_to] step {direction} from world {cur} failed; "
+                      f"aborting")
+                return False
+            # Stepped successfully -- loop and re-pathfind. Re-pathfinding
+            # after every step is cheap (BFS over <100 maps) and self-heals
+            # if the switch click delivered us to an unexpected map.
+
+    def _walk_one_step(self, entry, direction, on_aggro):
+        """Click the switch cell for `direction` on `entry`'s map and
+        wait for either a map change or an aggro.
+
+        Returns (stepped, fought) tuple:
+          stepped=True if map_id changed without aggro
+          fought=True  if we aggroed and `on_aggro` ran (caller should
+                       re-pathfind, ignore `stepped`)
+
+        Both False means the click didn't change the map within
+        MAP_CHANGE_TIMEOUT (caller should abort).
+        """
+        switches = entry.get("switch_cells") or {}
+        switch_cell = switches.get(direction)
+        if switch_cell is None:
+            print(f"[walk_to] no {direction} switch on current map "
+                  f"({entry.get('map_id')}); aborting")
+            return (False, False)
+        before_map = entry["map_id"]
+        print(f"[walk_to] walking {direction} from map={before_map} via "
+              f"switch cell={switch_cell}")
+        click_cell(switch_cell, self.cal)
+        if not wait_for(
+            self.state,
+            lambda s, bm=before_map: (s.map_id != bm and s.map_id != 0)
+                                     or s.in_fight,
+            MAP_CHANGE_TIMEOUT,
+        ):
+            print(f"[walk_to] walk {direction} did not change map in "
+                  f"{MAP_CHANGE_TIMEOUT}s")
+            return (False, False)
+        post = self.state.snapshot()
+        if post.in_fight:
+            if on_aggro is None:
+                print(f"[walk_to] aggroed while walking {direction}; no "
+                      f"fight handler provided, aborting")
+                return (False, False)
+            print(f"[walk_to] aggroed while walking {direction}; running "
+                  f"fight handler, will re-pathfind after")
+            on_aggro()
+            return (False, True)
+        # Map changed cleanly. Wait for my_cell to repopulate so the next
+        # iteration sees a real snapshot, mirroring on_map_changed.
+        wait_for(self.state, lambda s: s.my_cell != 0, 2.0, poll=0.05)
+        new = self.state.snapshot()
+        print(f"[walk_to] arrived on map_id={new.map_id}")
+        return (True, False)
 
     def _maybe_log_no_progress(self, snap, entry, switch_cells_map, safe,
                                max_group_size, now):

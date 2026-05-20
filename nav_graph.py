@@ -1,15 +1,15 @@
 """Debug-print the navigation graph the bot will traverse.
 
-Reads every map_data/*.json and reports which NSEW exits are
+Reads every row from the `maps` table and reports which NSEW exits are
 bi-directionally calibrated (= the bot will walk through them).
-Run any time map_data/ changes:
+Run any time the map_data DB changes:
 
     python3 nav_graph.py
 
 Sections:
   - Connected edges: bi-directional, bot will traverse.
   - One-way edges:   target map exists but lacks the return switch cell.
-  - Dangling edges:  target world coord has no map_data file.
+  - Dangling edges:  target world coord has no calibrated row.
   - Per-map summary: NSEW status per map.
   - Isolated maps:   no safe exit -- bot would be stuck on these.
 """
@@ -32,7 +32,7 @@ def _world_key(entry):
 def main():
     data = load_all()
     if not data:
-        print("no map_data files found.")
+        print("no calibrated maps in DB.")
         return
     by_world = build_world_index(data)
 
@@ -80,7 +80,7 @@ def main():
     if not dangling:
         print("  (none)")
     for aw, ad, tw in sorted(dangling):
-        print(f"  {aw} {ad} -> {tw}  [no map_data file]")
+        print(f"  {aw} {ad} -> {tw}  [no calibration row]")
 
     print("\n== Per-map summary ==")
     isolated = []

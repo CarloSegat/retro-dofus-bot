@@ -97,16 +97,34 @@ def click():
     _xdotool("click", "1")
 
 
+def _split_chord(key):
+    """Split a chord string like "ctrl+2" into (modifiers, main_key).
+    Plain keys come back as ([], key). Used by press/press_focused so
+    callers can supply modified hotkeys (Dofus uses ctrl+<num> for the
+    second hotbar row)."""
+    parts = key.split("+")
+    if len(parts) == 1:
+        return [], parts[0]
+    return parts[:-1], parts[-1]
+
+
 def press(key, hold_sec=0.1):
-    """Press one key with a 100ms button-down hold.
+    """Press one key (or chord like "ctrl+2") with a 100ms button-down
+    hold.
 
     The hold mimics a real keystroke; Dofus retro samples input and
     silently drops sub-millisecond down+up taps (we hit this with both
     pyautogui.press and bare `xdotool key`). `key` uses X11 names
-    (e.g. 'Escape', not 'esc')."""
-    _xdotool("keydown", key)
+    (e.g. 'Escape', not 'esc'). Chords are split on '+', modifiers
+    held first and released last so the OS sees a real modified key."""
+    mods, main = _split_chord(key)
+    for m in mods:
+        _xdotool("keydown", m)
+    _xdotool("keydown", main)
     time.sleep(hold_sec)
-    _xdotool("keyup", key)
+    _xdotool("keyup", main)
+    for m in reversed(mods):
+        _xdotool("keyup", m)
 
 
 # ============================================================
@@ -157,16 +175,22 @@ def click_at_focused(x, y):
 
 
 def press_focused(key, hold_sec=0.1):
-    """Press one key after windowactivate, with keyup/keydown
-    --window-targeted at Dofus.
+    """Press one key (or chord like "ctrl+2") after windowactivate,
+    with keyup/keydown --window-targeted at Dofus.
 
     Use when focus may have shifted (post-fight Esc -- the XP-summary
     transition can leave focus on the terminal, and an un-focused key
     event is dropped by Wine)."""
     wid = _focus_dofus_window()
-    _xdotool("keydown", *_maybe_window(wid), key)
+    win = _maybe_window(wid)
+    mods, main = _split_chord(key)
+    for m in mods:
+        _xdotool("keydown", *win, m)
+    _xdotool("keydown", *win, main)
     time.sleep(hold_sec)
-    _xdotool("keyup", *_maybe_window(wid), key)
+    _xdotool("keyup", *win, main)
+    for m in reversed(mods):
+        _xdotool("keyup", *win, m)
 
 
 def type_text_focused(text):

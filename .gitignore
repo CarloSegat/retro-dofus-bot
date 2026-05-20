@@ -4,3 +4,6 @@ __pycache__/
 debug/
 *.swp
 .DS_Store
+# Dofus Retro installer AppImage — baked into the desktop image via
+# desktop/Dockerfile COPY, never committed (288 MB).
+desktop/Retro-Setup-x86_64.AppImage

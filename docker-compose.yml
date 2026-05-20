@@ -1,0 +1,98 @@
+# Postgres for the auto-fighter map_data store.
+#
+# Bring up:   docker compose up -d db
+# Tear down:  docker compose down            (data persists in the volume)
+# Wipe:       docker compose down -v         (drops the volume — destroys data)
+#
+# The schema in db/schema.sql is applied automatically the *first* time
+# the container starts against an empty data volume (postgres image
+# convention: anything in /docker-entrypoint-initdb.d/ runs on init).
+# After that, schema changes must be applied manually (or via a future
+# migration tool) — re-running compose does NOT re-run init scripts.
+#
+# Bound to 127.0.0.1 only — the DB is for local containers/scripts,
+# not the network.
+
+services:
+  db:
+    image: postgres:16
+    container_name: auto-fighter-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: auto
+      POSTGRES_PASSWORD: auto
+      POSTGRES_DB: auto_fighter
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - auto_fighter_pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auto -d auto_fighter"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # XFCE desktop accessible over VNC (5901) and noVNC (6080).
+  # See desktop/Dockerfile for the build recipe. The project repo is
+  # bind-mounted at /workspace so the bot code is reachable from inside.
+  #
+  # Bring up:  docker compose up -d desktop
+  # View:      http://localhost:6080/vnc.html   (password: $VNC_PASSWORD, default "secret")
+  #            or VNC viewer -> localhost:5901
+  desktop:
+    build:
+      context: ./desktop
+      args:
+        USER_UID: "1000"
+        USER_GID: "1000"
+    container_name: auto-fighter-desktop
+    restart: unless-stopped
+    environment:
+      VNC_PASSWORD: ${VNC_PASSWORD:-secret}
+      VNC_GEOMETRY: ${VNC_GEOMETRY:-1280x800}
+      # Reach the sibling `db` service by its compose hostname.
+      # Inside this container, 127.0.0.1 is the container itself, not
+      # the host's Postgres port-forward.
+      MAP_DB_URL: postgresql://auto:auto@db:5432/auto_fighter
+      # mss's default XShmGetImage backend trips on TigerVNC's
+      # duplicate-depth-24 visual list ("drawable's visual not found
+      # in screen's supported visuals"). xgetimage is the same XCB
+      # backend without the XShm-init probe -- minor speed cost,
+      # which we don't care about (bot drives off proxy data, not
+      # screen capture). Default ("default") stays correct on the
+      # host's real X server.
+      MSS_BACKEND: xgetimage
+    ports:
+      - "127.0.0.1:5901:5901"
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - .:/workspace
+      # Persist the Dofus Retro / Ankama Launcher install and config
+      # (saved credentials, in-game settings, character keybinds,
+      # XFCE desktop state, etc.) so `docker compose down` + `up`
+      # doesn't wipe them. Dofus stores everything under ~/.config/
+      # (Electron convention on Linux), NOT ~/.local/share/.
+      - dofus_user_config:/home/bot/.config
+      # Inherit host wall-clock timezone. Containers already share the
+      # host's monotonic clock via the kernel, so UTC time is correct
+      # automatically -- this is just so log timestamps, in-game time,
+      # and TLS validity windows match the host's displayed time.
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    # Firefox / GTK apps over-allocate /dev/shm at default 64 MB and crash.
+    shm_size: "1gb"
+    # AppImages (Dofus Retro installer, etc.) mount themselves via FUSE.
+    # Needs the userspace lib (baked into the image), the kernel device
+    # exposed, and SYS_ADMIN to call mount(2). Alternative: extract the
+    # AppImage with `--appimage-extract` to avoid needing these.
+    devices:
+      - "/dev/fuse"
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+
+volumes:
+  auto_fighter_pgdata:
+  dofus_user_config:

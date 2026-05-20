@@ -3,6 +3,7 @@
 Pre-reqs:
   - Go proxy running on 127.0.0.1:9999 with my_id and map_id populated.
   - config.json has cell_calibration.
+  - The map_data Postgres DB is reachable (see docker-compose.yml).
 
 Usage:
     python3 calibrate_map_cells.py <world_x> <world_y> [N] [--obs-only|--switches-only]
@@ -11,11 +12,11 @@ Default N=2 starting positions.
 
   --obs-only: skip phases 1 and 2 and only edit the obstacle list of an
               already-calibrated map. The existing cells/switch_cells
-              are preserved. Requires the map_data file to exist.
+              are preserved. Requires the map to already exist in the DB.
 
   --switches-only: skip phases 1 and 3 and only re-do the NSEW switch
               cells. The existing cells/obstacles are preserved.
-              Requires the map_data file to exist.
+              Requires the map to already exist in the DB.
 
 Flow:
   Phase 1 — N starting-cell clicks:
@@ -37,15 +38,10 @@ Flow:
     preloaded so shift+click can drop specific entries while plain
     clicks keep adding new ones.
 
-After all phases, writes map_data/<world_x>_<world_y>.json:
-    {
-      "world":        [x, y],
-      "map_id":       <id>,
-      "cells":        [<start>, ...],
-      "switch_cells": {"north": <cell>, ...},   # only registered dirs
-      "obstacles":    [<blocked>, ...],
-      "saved_at":     "..."
-    }
+After all phases, upserts a row in the `maps` table (plus rewrites the
+`start_cells`/`switch_cells`/`obstacles` rows for this map_id). Any
+resources or POIs that were recorded against the map are left
+untouched.
 """
 import argparse
 import json
@@ -57,10 +53,10 @@ from pathlib import Path
 from pynput import keyboard, mouse
 
 from dofus.cell_grid import xy_to_cell
+from dofus.map_data import build_world_index, load_all as load_map_data, save as save_map_data
 from dofus.proxy_client import ProxyState
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
-MAP_DATA_DIR = Path(__file__).with_name("map_data")
 PROXY_ADDR = "127.0.0.1:9999"
 SWITCH_DIRECTIONS = ["north", "east", "south", "west"]
 
@@ -90,45 +86,40 @@ def main():
     world_x, world_y, n = args.world_x, args.world_y, args.n
     obs_only, switches_only = args.obs_only, args.switches_only
 
-    out_path = MAP_DATA_DIR / f"{world_x}_{world_y}.json"
-    preloaded: dict = {}
-    preloaded_obstacles: list[int] = []
+    try:
+        existing = build_world_index(load_map_data()).get((world_x, world_y))
+    except Exception as exc:
+        print(f"[calibrate-map-cells] could not query map_data DB: {exc}")
+        sys.exit(1)
+    preloaded: dict = existing or {}
+    preloaded_obstacles: list[int] = list(preloaded.get("obstacles") or [])
     if obs_only or switches_only:
         flag_name = "--obs-only" if obs_only else "--switches-only"
-        if not out_path.exists():
-            print(f"[calibrate-map-cells] {flag_name} requires {out_path} to "
-                  f"already exist. Run a full calibration first.")
+        if not existing:
+            print(f"[calibrate-map-cells] {flag_name} requires world "
+                  f"({world_x},{world_y}) to already exist in the DB. "
+                  f"Run a full calibration first.")
             sys.exit(1)
-        try:
-            preloaded = json.loads(out_path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"[calibrate-map-cells] could not read {out_path}: {exc}")
-            sys.exit(1)
-        preloaded_obstacles = list(preloaded.get("obstacles") or [])
         if obs_only:
             print(f"[calibrate-map-cells] --obs-only: preserving "
                   f"{len(preloaded.get('cells') or [])} start cell(s) and "
                   f"{len(preloaded.get('switch_cells') or {})} switch cell(s) "
-                  f"from {out_path}")
+                  f"from DB (map_id={preloaded.get('map_id')})")
         else:
             print(f"[calibrate-map-cells] --switches-only: preserving "
                   f"{len(preloaded.get('cells') or [])} start cell(s) and "
-                  f"{len(preloaded_obstacles)} obstacle(s) from {out_path}")
-    elif out_path.exists():
+                  f"{len(preloaded_obstacles)} obstacle(s) from DB "
+                  f"(map_id={preloaded.get('map_id')})")
+    elif existing:
         resp = input(
-            f"[calibrate-map-cells] {out_path} already exists. "
-            f"Recalibrating will overwrite cells/switches; obstacles "
-            f"are preloaded so shift+click can drop entries. Continue? [y/N] "
+            f"[calibrate-map-cells] world ({world_x},{world_y}) is already "
+            f"calibrated (map_id={existing.get('map_id')}). Recalibrating "
+            f"will overwrite cells/switches; obstacles are preloaded so "
+            f"shift+click can drop entries. Continue? [y/N] "
         ).strip().lower()
         if resp not in ("y", "yes"):
             print("[calibrate-map-cells] aborted.")
             sys.exit(0)
-        try:
-            preloaded = json.loads(out_path.read_text())
-            preloaded_obstacles = list(preloaded.get("obstacles") or [])
-        except (OSError, json.JSONDecodeError):
-            preloaded = {}
-            preloaded_obstacles = []
 
     cfg = json.loads(CONFIG_PATH.read_text())
     cal = cfg.get("cell_calibration")
@@ -334,21 +325,25 @@ def main():
     mouse_listener.stop()
     key_listener.stop()
 
-    MAP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Build a partial entry: only the keys we actually re-calibrated this
+    # run. dofus.map_data.save() leaves the other child tables alone, so
+    # --obs-only / --switches-only / a full run all do the right thing
+    # without explicit branching here.
     data = {
         "world": [world_x, world_y],
         "map_id": map_id,
-        "cells": cells,
-        "switch_cells": switch_cells,
-        "obstacles": sorted(set(obstacles)),
-        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    out_path.write_text(json.dumps(data, indent=2))
+    if not obs_only:
+        data["cells"] = cells
+        data["switch_cells"] = switch_cells
+    if not switches_only:
+        data["obstacles"] = sorted(set(obstacles))
+    save_map_data(data)
     print(f"\n[calibrate-map-cells] saved {len(cells)} start cell(s), "
           f"{len(switch_cells)} switch cell(s) ({', '.join(switch_cells) or 'none'}), "
           f"and {len(obstacles)} obstacle(s) for map_id={map_id} "
           f"world=({world_x},{world_y}).")
-    print(f"[calibrate-map-cells] wrote {out_path}")
+    print(f"[calibrate-map-cells] wrote to map_data DB")
 
     state.stop()
 

@@ -1,0 +1,14 @@
+{
+  "world": [
+    4,
+    -7
+  ],
+  "map_id": 9459,
+  "cells": [],
+  "switch_cells": {
+    "south": 460,
+    "north": 16
+  },
+  "obstacles": [],
+  "saved_at": "2026-05-19 07:29:10"
+}

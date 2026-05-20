@@ -215,8 +215,9 @@ def a_star(start, goal, blocked=()):
 
     Pair with `calibrate_map_cells.py` output:
 
-        data = json.loads(Path("map_data/0_4.json").read_text())
-        path = a_star(start_cell, goal_cell, blocked=data["obstacles"])
+        from dofus.map_data import build_world_index, load_all
+        entry = build_world_index(load_all())[(0, 4)]
+        path = a_star(start_cell, goal_cell, blocked=entry["obstacles"])
     """
     import heapq
 

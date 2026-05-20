@@ -120,10 +120,14 @@ type stateTracker struct {
 	myLifeMax       int   // out-of-fight max HP, from server "As" packet
 	myLifeAnchorMs  int64 // unix ms when myLife was set (basis for regen estimate)
 	myLifeRegenMs   int   // server-stated regen rate (ms per HP) from "ILS<n>" packet
+	pods              int // current inventory weight (Ow packet field 0)
+	podsMax           int // soft cap, no penalty below (Ow field 2)
+	podsMaxOverweight int // hard cap, movement blocked at/above (Ow field 3)
 	phase         FightPhase
 	mobs          map[int]MobGroup    // keyed by cell
 	players       map[int]Player      // keyed by player id
 	fightEntities map[int]FightEntity // keyed by actor id (in-fight only)
+	summons       map[int]int         // summonId -> summonerId (in-fight only)
 
 	// Turn state, driven by GTS<actorId>|<dur_ms>|<turn_n> packets.
 	// Reset on phase transitions back to idle.
@@ -164,14 +168,20 @@ type Player struct {
 // FightEntity is one combatant in an active fight, derived from GTM packets.
 // All numeric fields are 0 if unparseable. Alive=false means the entity
 // collapsed to "<id>;1" in the GTM list (dead this turn).
+//
+// IsSummon / SummonerID are stamped from the running summons map (built
+// from GA;181 packets, see applySummonSpawn). GTM itself has no in-band
+// summon flag -- only the GA;181 history distinguishes.
 type FightEntity struct {
-	ID    int  `json:"id"`
-	Cell  int  `json:"cell"`
-	HP    int  `json:"hp"`
-	AP    int  `json:"ap"`
-	MP    int  `json:"mp"`
-	HPMax int  `json:"hp_max"`
-	Alive bool `json:"alive"`
+	ID         int  `json:"id"`
+	Cell       int  `json:"cell"`
+	HP         int  `json:"hp"`
+	AP         int  `json:"ap"`
+	MP         int  `json:"mp"`
+	HPMax      int  `json:"hp_max"`
+	Alive      bool `json:"alive"`
+	IsSummon   bool `json:"is_summon"`
+	SummonerID int  `json:"summoner_id"`
 }
 
 func newStateTracker(hub *eventHub) *stateTracker {
@@ -181,6 +191,7 @@ func newStateTracker(hub *eventHub) *stateTracker {
 		mobs:          make(map[int]MobGroup),
 		players:       make(map[int]Player),
 		fightEntities: make(map[int]FightEntity),
+		summons:       make(map[int]int),
 	}
 }
 
@@ -222,6 +233,22 @@ func (s *stateTracker) Apply(pkt string) {
 		// Same format but seen for in-fight moves and mob walks. Mob
 		// movement is ignored by applyMovement (only myID matters here).
 		s.applyMovement(pkt[5:])
+	case strings.HasPrefix(pkt, "GA;181;"):
+		// GA;181;<casterId>;+<cell>;<kind>;<flag>;<summonedId>;<lvls>;<subkind>;<gfx^lvl>;...
+		// Summon spawn during combat. The body after the casterId mirrors
+		// a GM|+ entity payload (note the leading "+" on the cell). Subkind
+		// is -1 for true summons (vs -2 for placement-burst in-fight mobs
+		// and -3 for idle aggressive groups). We stash summonedId in
+		// s.summons so the following GTM can stamp IsSummon/SummonerID on
+		// the entity row -- GTM itself has no summon flag.
+		s.applySummonSpawn(pkt[len("GA;181;"):])
+	case strings.HasPrefix(pkt, "GA;4;"):
+		// GA;4;<casterId>;<actorId>,<newCell> -- Transposition (Sacrieur
+		// "Swap") position update. Fires twice per cast inside the
+		// caster's GAS|...|GAF block, once per swapper (target first,
+		// then caster). Teleport, not a path, so applyMovement's GA;1;
+		// path decoder can't be reused.
+		s.applySwapMove(pkt[5:])
 	case strings.HasPrefix(pkt, "GTM|"):
 		// In-fight roster + state snapshot. Format:
 		//   GTM|<entity>|<entity>|...
@@ -242,6 +269,17 @@ func (s *stateTracker) Apply(pkt string) {
 		// up, pickup). Field index 5 (0-based, pipe-split) is the
 		// "<life>,<maxLife>" pair -- our out-of-fight HP source.
 		s.applyAs(pkt[2:])
+	case strings.HasPrefix(pkt, "Ow") && len(pkt) > 2 && pkt[2] >= '0' && pkt[2] <= '9':
+		// Inventory weight packet. Format:
+		//   Ow<current>|<?>|<soft_cap>|<hard_cap>
+		// e.g. Ow1426|0|1043|3900 = 1426 current pods, 1043 normal max,
+		// 3900 absolute max. Between soft_cap and hard_cap the character
+		// walks slowly (overweight); at hard_cap movement is blocked.
+		// Field 1 is consistently 0 in observed packets -- best guess is
+		// trade/exchange weight; not used by the bot. Server pushes Ow
+		// after every inventory delta (loot, drop, sell) so it fires in
+		// bursts during fight wrap-up.
+		s.applyOw(pkt[2:])
 	case strings.HasPrefix(pkt, "ILS"):
 		// Out-of-fight HP regen rate, in ms per +1 HP. Server fires it
 		// once right after the post-fight "As" anchor; no further HP
@@ -316,6 +354,58 @@ func (s *stateTracker) applyMovement(body string) {
 				changed = true
 				break
 			}
+		}
+	}
+	s.mu.Unlock()
+	if changed {
+		s.emitSnapshot()
+	}
+}
+
+// applySwapMove consumes "<casterId>;<actorId>,<newCell>" from a GA;4;
+// (Transposition) packet and teleports actorID to newCell. Updates
+// myCell + fightEntities[myID] when actorID==myID, and
+// fightEntities[actorID] for mob targets (in-fight only -- swap is a
+// fight-only spell). Two GA;4 fire per swap (target first, then
+// caster), so this gets called twice with both sides of the swap.
+func (s *stateTracker) applySwapMove(body string) {
+	parts := strings.SplitN(body, ";", 2)
+	if len(parts) < 2 {
+		return
+	}
+	sub := strings.SplitN(parts[1], ",", 2)
+	if len(sub) < 2 {
+		return
+	}
+	actorID, err := strconv.Atoi(sub[0])
+	if err != nil {
+		return
+	}
+	newCell, err := strconv.Atoi(sub[1])
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	changed := false
+	if actorID == s.myID && s.myID != 0 {
+		if s.myCell != newCell {
+			log.Printf("[state] my_cell %d -> %d (swap GA;4)", s.myCell, newCell)
+			s.myCell = newCell
+			changed = true
+		}
+		if s.phase == PhaseCombat {
+			if me, ok := s.fightEntities[s.myID]; ok && me.Cell != newCell {
+				me.Cell = newCell
+				s.fightEntities[s.myID] = me
+				changed = true
+			}
+		}
+	} else if s.phase == PhaseCombat {
+		if ent, ok := s.fightEntities[actorID]; ok && ent.Cell != newCell {
+			log.Printf("[state] swap actor=%d cell %d -> %d", actorID, ent.Cell, newCell)
+			ent.Cell = newCell
+			s.fightEntities[actorID] = ent
+			changed = true
 		}
 	}
 	s.mu.Unlock()
@@ -421,6 +511,7 @@ func (s *stateTracker) setPhase(phase FightPhase, reason string) {
 	s.phase = phase
 	if phase == PhaseIdle {
 		s.fightEntities = make(map[int]FightEntity)
+		s.summons = make(map[int]int)
 		s.turnActor = 0
 		s.turnNumber = 0
 		s.turnStartedAtMs = 0
@@ -479,6 +570,13 @@ func (s *stateTracker) applyGTM(body string) {
 		entities[id] = e
 	}
 	s.mu.Lock()
+	for id, e := range entities {
+		if summonerID, ok := s.summons[id]; ok {
+			e.IsSummon = true
+			e.SummonerID = summonerID
+			entities[id] = e
+		}
+	}
 	s.fightEntities = entities
 	needPromote := s.phase != PhaseCombat
 	s.mu.Unlock()
@@ -489,6 +587,43 @@ func (s *stateTracker) applyGTM(body string) {
 		s.setPhase(PhaseCombat, "GTM seen outside combat")
 		return
 	}
+	s.emitSnapshot()
+}
+
+// applySummonSpawn parses "<casterId>;+<cell>;<kind>;<flag>;<summonedId>;
+// <lvls>;<subkind>;..." from a GA;181 body (no leading "GA;181;"). When
+// subkind == -1 (true summon, distinct from -2 in-fight mob and -3 idle
+// mob group) we remember (summonedId -> casterId) so the next GTM stamps
+// IsSummon on the entity row. Wire example, mob -2 summoning -6:
+//
+//	GA;181;-2;+288;1;0;-6;111;-1;1072^95;2;-1;-1;-1;0,0,0,0;40;7;9;1;1;40
+func (s *stateTracker) applySummonSpawn(body string) {
+	fields := strings.Split(body, ";")
+	if len(fields) < 7 {
+		return
+	}
+	casterID, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return
+	}
+	summonedID, err := strconv.Atoi(fields[4])
+	if err != nil {
+		return
+	}
+	if fields[6] != "-1" {
+		return
+	}
+	s.mu.Lock()
+	s.summons[summonedID] = casterID
+	// If the entity row is already in fightEntities (rare -- GA;181 always
+	// fires before the GTM in practice, but cheap to handle), stamp it now.
+	if e, ok := s.fightEntities[summonedID]; ok {
+		e.IsSummon = true
+		e.SummonerID = casterID
+		s.fightEntities[summonedID] = e
+	}
+	s.mu.Unlock()
+	log.Printf("[state] summon: caster=%d summoned=%d", casterID, summonedID)
 	s.emitSnapshot()
 }
 
@@ -525,6 +660,33 @@ func (s *stateTracker) applyAs(body string) {
 	// server is asserting "this is your HP right now" so the regen
 	// extrapolation must restart from this moment.
 	s.myLifeAnchorMs = nowMs
+	s.mu.Unlock()
+	if changed {
+		s.emitSnapshot()
+	}
+}
+
+// applyOw parses the body of an "Ow<cur>|<?>|<soft>|<hard>" packet (no
+// leading "Ow"). Only re-emits a snapshot when any value actually
+// changed -- the server bursts several Ow packets in a row when loot
+// is added one item at a time, and we don't want a state event per
+// stack tick.
+func (s *stateTracker) applyOw(body string) {
+	fields := strings.Split(body, "|")
+	if len(fields) < 4 {
+		return
+	}
+	cur, err1 := strconv.Atoi(fields[0])
+	soft, err2 := strconv.Atoi(fields[2])
+	hard, err3 := strconv.Atoi(fields[3])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return
+	}
+	s.mu.Lock()
+	changed := s.pods != cur || s.podsMax != soft || s.podsMaxOverweight != hard
+	s.pods = cur
+	s.podsMax = soft
+	s.podsMaxOverweight = hard
 	s.mu.Unlock()
 	if changed {
 		s.emitSnapshot()
@@ -656,6 +818,7 @@ func (s *stateTracker) applyGDM(body string) {
 		s.players = make(map[int]Player)
 		s.myCell = 0
 		s.fightEntities = make(map[int]FightEntity)
+		s.summons = make(map[int]int)
 	}
 	s.mu.Unlock()
 	if changed {
@@ -790,6 +953,9 @@ func (s *stateTracker) emitSnapshot() {
 		"my_life_max":        s.myLifeMax,
 		"my_life_anchor_ms":  s.myLifeAnchorMs,
 		"my_life_regen_ms":   s.myLifeRegenMs,
+		"pods":                s.pods,
+		"pods_max":            s.podsMax,
+		"pods_max_overweight": s.podsMaxOverweight,
 		"fight_phase":        string(s.phase),
 		"mobs":               mobs,
 		"players":            players,

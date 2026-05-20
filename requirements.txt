@@ -3,3 +3,4 @@ numpy
 pynput
 pytesseract
 Pillow
+psycopg[binary]>=3.1

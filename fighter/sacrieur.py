@@ -2,7 +2,7 @@
 
 Owns the walking helpers (used during combat to close on enemies) and
 the tofu detector (kiter retreat mode). play_turn(ctx) is the body of
-a single combat turn: walk, cast, bow, follow-up, pass. The class
+a single combat turn: walk, cast, attract, follow-up, pass. The class
 holds fight-scoped state (tofu detector, buff cooldown) that
 on_fight_engaged resets at the start of each fight.
 
@@ -14,7 +14,8 @@ import time
 
 from dofus.actions import cast_at_cell, pass_turn
 from dofus.cell_grid import (
-    a_star, cell_distance, cell_to_screen, line_of_sight, neighbors, on_map,
+    a_star, cell_distance, cell_to_screen, cell_to_uv, line_of_sight,
+    neighbors, on_map,
 )
 from dofus.map_data import save as save_map_data
 from mouse_keyboard import click_at
@@ -25,15 +26,25 @@ from utils import CFG
 # === Config-driven knobs ===
 DISSOLUTION_HOTKEY = CFG.get("sacrid_dissolution_hotkey")
 DISSOLUTION_AP_COST = int(CFG.get("sacrid_dissolution_ap_cost", 4))
-BOW_HOTKEY = CFG.get("sacrid_bow_hotkey", "0")
-BOW_AP_COST = int(CFG.get("sacrid_bow_ap_cost", 4))
-BOW_MIN_RANGE = int(CFG.get("sacrid_bow_min_range", 2))
-BOW_MAX_RANGE = int(CFG.get("sacrid_bow_max_range", 6))
-BOW_POST_WALK_EXTRA_SETTLE_SEC = float(CFG.get("sacrid_bow_post_walk_settle_sec", 0.33))
+DISSOLUTION_POST_WALK_EXTRA_SETTLE_SEC = float(CFG.get("sacrid_dissolution_post_walk_settle_sec", 0.33))
 BUFF_HOTKEY = CFG.get("sacrid_buff_hotkey", "3")
 BUFF_AP_COST = int(CFG.get("sacrid_buff_ap_cost", 3))
 BUFF_MAX_DIST = int(CFG.get("sacrid_buff_max_dist", 6))
 BUFF_COOLDOWN_TURNS = int(CFG.get("sacrid_buff_cooldown_turns", 5))
+VITAL_HOTKEY = CFG.get("sacrid_vital_hotkey", "ctrl+6")
+VITAL_AP_COST = int(CFG.get("sacrid_vital_ap_cost", 3))
+VITAL_COOLDOWN_TURNS = int(CFG.get("sacrid_vital_cooldown_turns", 4))
+VITAL_POST_WALK_EXTRA_SETTLE_SEC = float(CFG.get("sacrid_vital_post_walk_settle_sec", 0.33))
+ATTRACTION_HOTKEY = CFG.get("sacrid_attraction_hotkey", "1")
+ATTRACTION_AP_COST = int(CFG.get("sacrid_attraction_ap_cost", 3))
+ATTRACTION_MIN_RANGE = int(CFG.get("sacrid_attraction_min_range", 1))
+ATTRACTION_MAX_RANGE = int(CFG.get("sacrid_attraction_max_range", 10))
+ATTRACTION_POST_WALK_EXTRA_SETTLE_SEC = float(
+    CFG.get("sacrid_attraction_post_walk_settle_sec", 0.33))
+SWAP_HOTKEY = CFG.get("sacrid_swap_hotkey", "5")
+SWAP_AP_COST = int(CFG.get("sacrid_swap_ap_cost", 2))
+SWAP_MIN_AP = int(CFG.get("sacrid_swap_min_ap", 6))
+SWAP_POST_WALK_EXTRA_SETTLE_SEC = float(CFG.get("sacrid_swap_post_walk_settle_sec", 0.33))
 CAST_WAIT_SEC = float(CFG.get("sacrid_cast_wait_sec", 0.8))
 PASS_TURN_HOTKEY = CFG.get("pass_turn_hotkey", "e")
 PASS_TURN_PRE_DELAY_SEC = float(CFG.get("pass_turn_pre_delay_sec", 1.5))
@@ -391,9 +402,10 @@ def walk_toward(target_cell, state, cal, static_obstacles=(), mp_override=None,
 
 class Sacrieur:
     """Per-turn decision logic for the Sacrieur character. Owns spells
-    (Dissolution self-cast AoE, Strength Punishment self-buff, bow
-    ranged) and fight-scoped state (tofu detector, buff cooldown,
-    static obstacles for the current map).
+    (Dissolution self-cast AoE, Bold Punishment self-buff, Vital
+    Punishment self-cast, Swap, Attraction ranged pull) and
+    fight-scoped state (tofu detector, buff cooldown, static obstacles
+    for the current map).
 
     play_turn(ctx) is registered on Combat.on_turn_start.
     on_fight_engaged(snap) is registered on Combat.on_fight_engaged."""
@@ -405,6 +417,7 @@ class Sacrieur:
         self.buff_enabled = buff_enabled
         # Fight-scoped state -- reset on on_fight_engaged.
         self.last_buff_turn = -BUFF_COOLDOWN_TURNS
+        self.last_vital_turn = -VITAL_COOLDOWN_TURNS
         self.static_obstacles: set[int] = set()
         self.dist_tracker = TurnDistanceTracker(TOFU_THRESHOLD, TOFU_REQUIRED_CYCLES)
 
@@ -414,6 +427,7 @@ class Sacrieur:
         """Reset fight-scoped state. Loads static obstacles for the
         current map and prunes any that overlap live entities."""
         self.last_buff_turn = -BUFF_COOLDOWN_TURNS
+        self.last_vital_turn = -VITAL_COOLDOWN_TURNS
         map_id = snap.map_id
         self._prune_obstacles_from_entities(map_id, snap)
         self.static_obstacles = set(
@@ -467,10 +481,18 @@ class Sacrieur:
         if not self.buff_enabled:
             pass
         elif buff_ready and me_cell and my_ap >= BUFF_AP_COST:
-            if nearest_dist <= BUFF_MAX_DIST:
+            # If a Dissolution is firing this turn (enemy already adjacent),
+            # don't burn AP on the buff unless we'd still have enough left
+            # to also cast Dissolution. Otherwise the buff steals the hit
+            # -- exactly what happens under enemy AP-drain.
+            needed = BUFF_AP_COST + DISSOLUTION_AP_COST
+            if nearest_dist == 1 and my_ap < needed:
+                print(f"  buff: skip (adjacent enemy, ap={my_ap} < "
+                      f"buff+dissolution={needed}; preserving AP for Dissolution)")
+            elif nearest_dist <= BUFF_MAX_DIST:
                 print(f"  buff: nearest_dist={nearest_dist} <= {BUFF_MAX_DIST}, "
                       f"cooldown ready (last_cast_turn={self.last_buff_turn}), casting")
-                self._cast_strength_punishment(me_cell)
+                self._cast_bold_punishment(me_cell)
                 time.sleep(CAST_WAIT_SEC)
                 my_ap -= BUFF_AP_COST
                 self.last_buff_turn = new_turn
@@ -498,9 +520,28 @@ class Sacrieur:
             dist = (cell_distance(me_cell, enemies[0].cell)
                     if enemies and me_cell else 99)
 
+        # Pre-Dissolution swap setup: if exactly one enemy is adjacent and
+        # that enemy has another enemy adjacent to it, swap with it so the
+        # follow-up Dissolution hits both enemies. Skipped if 2+ already
+        # adjacent (Dissolution already double-hits) or ap<SWAP_MIN_AP
+        # (after swap we wouldn't have enough left for Dissolution too).
+        if dist == 1:
+            swap_target = self._pick_swap_target(me_cell, my_ap)
+            if swap_target is not None:
+                if pending_settle > 0:
+                    time.sleep(pending_settle + SWAP_POST_WALK_EXTRA_SETTLE_SEC)
+                    pending_settle = 0.0
+                old_cell = me_cell
+                self._cast_swap(swap_target.cell)
+                time.sleep(CAST_WAIT_SEC)
+                my_ap -= SWAP_AP_COST
+                me_cell = self._me_cell_after_swap(old_cell, swap_target.cell)
+                print(f"  swap landed: me_cell {old_cell} -> {me_cell} "
+                      f"(ap_left~{my_ap})")
+
         if dist == 1 and my_ap >= DISSOLUTION_AP_COST:
             if pending_settle > 0:
-                time.sleep(pending_settle)
+                time.sleep(pending_settle + DISSOLUTION_POST_WALK_EXTRA_SETTLE_SEC)
                 pending_settle = 0.0
             self._cast_dissolution(me_cell)
             time.sleep(CAST_WAIT_SEC)
@@ -511,16 +552,26 @@ class Sacrieur:
         elif dist > 1:
             print(f"  nothing adjacent (nearest_dist={dist}); not casting this turn")
 
-        # Bow burst with leftover AP. Clears tofu_detected if any hit.
-        if self.state.snapshot().in_combat and me_cell and my_ap >= BOW_AP_COST:
-            if pending_settle > 0:
-                time.sleep(pending_settle + BOW_POST_WALK_EXTRA_SETTLE_SEC)
-                pending_settle = 0.0
-            my_ap, bow_shots = self._fire_bow_burst(my_ap, me_cell)
-            if bow_shots > 0 and self.dist_tracker.tofu_detected:
-                print(f"  [tofu] bow connected ({bow_shots} shot(s)) from "
-                      f"normal-combat fall-through; exiting retreat mode")
-                self.dist_tracker.tofu_detected = False
+        # Attraction: pull the nearest line-aligned enemy with LoS. Replaces
+        # the old bow burst. One cast per turn (Retro caps Attraction at 1
+        # cast per target per turn, and a single pull is usually enough to
+        # bring the enemy adjacent for next turn's Dissolution). Clears
+        # tofu_detected on a successful pull -- once they're glued to us
+        # the kite is broken.
+        if (self.state.snapshot().in_combat and me_cell
+                and my_ap >= ATTRACTION_AP_COST):
+            target = self._pick_attraction_target(me_cell, my_ap)
+            if target is not None:
+                if pending_settle > 0:
+                    time.sleep(pending_settle + ATTRACTION_POST_WALK_EXTRA_SETTLE_SEC)
+                    pending_settle = 0.0
+                self._cast_attraction(target.cell)
+                time.sleep(CAST_WAIT_SEC)
+                my_ap -= ATTRACTION_AP_COST
+                if self.dist_tracker.tofu_detected:
+                    print(f"  [tofu] attraction pulled id={target.id}; "
+                          f"exiting retreat mode")
+                    self.dist_tracker.tofu_detected = False
 
         # Follow-up walk: close on a more-distant enemy with leftover MP.
         if self.state.snapshot().in_combat and mp_remaining > 0 and me_cell:
@@ -532,9 +583,31 @@ class Sacrieur:
                 print(f"  follow-up walk: closing toward id={follow.id} "
                       f"cell={follow.cell} dist={follow_dist} "
                       f"mp_left={mp_remaining} (fast-fail)")
-                me_cell, _, mp_remaining, _ = walk_toward(
+                me_cell, _, mp_remaining, pending_settle = walk_toward(
                     follow.cell, self.state, self.cal, self.static_obstacles,
                     mp_override=mp_remaining, fast_fail=True)
+
+        # Vital Punishment: leftover-AP filler, self-cast like Bold
+        # Punishment, 4-turn cooldown. Lowest priority -- only fires
+        # if AP survived buff + Dissolution + Attraction. Same post-walk
+        # hotkey-drop risk as the other spells.
+        if (self.state.snapshot().in_combat and me_cell
+                and my_ap >= VITAL_AP_COST):
+            turns_since_vital = new_turn - self.last_vital_turn
+            if turns_since_vital >= VITAL_COOLDOWN_TURNS:
+                if pending_settle > 0:
+                    time.sleep(pending_settle + VITAL_POST_WALK_EXTRA_SETTLE_SEC)
+                    pending_settle = 0.0
+                self._cast_vital_punishment(me_cell)
+                time.sleep(CAST_WAIT_SEC)
+                my_ap -= VITAL_AP_COST
+                self.last_vital_turn = new_turn
+                print(f"  vital cast on turn {new_turn}; ap_left~{my_ap} "
+                      f"(next available turn {new_turn + VITAL_COOLDOWN_TURNS})")
+            else:
+                print(f"  vital: on cooldown ({turns_since_vital}/"
+                      f"{VITAL_COOLDOWN_TURNS} turns since last cast on "
+                      f"turn {self.last_vital_turn})")
 
         if not self.state.snapshot().in_combat:
             return
@@ -554,22 +627,13 @@ class Sacrieur:
         can_retreat = me_cell is not None and pick_retreat_step(
             me_cell, nearest.cell, self.state.snapshot(),
             set(), set(self.static_obstacles)) is not None
-        can_bow = (my_ap >= BOW_AP_COST
-                   and self._pick_bow_target(self.state.snapshot(), me_cell)
-                       is not None)
-        steps_into_bow = (min(my_mp, dist - BOW_MIN_RANGE)
-                          if me_cell is not None and dist > BOW_MIN_RANGE
-                          else 0)
-        landing_dist = dist - steps_into_bow if steps_into_bow > 0 else dist
-        can_walk_to_bow = (my_ap >= BOW_AP_COST
-                           and steps_into_bow > 0
-                           and landing_dist <= BOW_MAX_RANGE
-                           and not (can_reach and can_attack))
-        if not will_attack and not can_retreat and not can_bow and not can_walk_to_bow:
+        can_attract = (me_cell is not None
+                       and self._pick_attraction_target(me_cell, my_ap) is not None)
+        if not will_attack and not can_retreat and not can_attract:
             print(f"  [tofu] cornered at {me_cell}: no retreat step "
                   f"from id={nearest.id} cell={nearest.cell} dist={dist} "
                   f"and can't close+cast (mp={my_mp} ap={my_ap}) "
-                  f"and no bow target in range with LoS; "
+                  f"and no attraction target on line with LoS; "
                   f"falling back to normal combat this turn")
             return False  # fall through
 
@@ -588,24 +652,11 @@ class Sacrieur:
                         if enemies and me_cell else 99)
             if dist == 1 and my_ap >= DISSOLUTION_AP_COST:
                 if pending_settle > 0:
-                    time.sleep(pending_settle)
+                    time.sleep(pending_settle + DISSOLUTION_POST_WALK_EXTRA_SETTLE_SEC)
                 self._cast_dissolution(me_cell)
                 time.sleep(CAST_WAIT_SEC)
                 my_ap -= DISSOLUTION_AP_COST
                 pending_settle = 0.0
-        elif can_walk_to_bow:
-            expected_landing = dist - steps_into_bow
-            print(f"  [tofu] closing {steps_into_bow} step(s) toward "
-                  f"bow range (dist={dist} -> ~{expected_landing}, "
-                  f"bow_range={BOW_MIN_RANGE}..{BOW_MAX_RANGE}, "
-                  f"mp={my_mp}, ap={my_ap})")
-            before_cell = me_cell
-            me_cell, _, _, pending_settle = walk_toward(
-                nearest.cell, self.state, self.cal, self.static_obstacles,
-                mp_override=steps_into_bow)
-            steps_used = (cell_distance(before_cell, me_cell)
-                          if me_cell and before_cell else 0)
-            mp_remaining = max(0, my_mp - steps_used)
         elif dist == 1 and can_attack:
             self._cast_dissolution(me_cell)
             time.sleep(CAST_WAIT_SEC)
@@ -614,16 +665,40 @@ class Sacrieur:
             print(f"  [tofu] adjacent but ap={my_ap} < "
                   f"{DISSOLUTION_AP_COST}; not casting")
 
-        if self.state.snapshot().in_combat and me_cell:
-            if pending_settle > 0:
-                time.sleep(pending_settle + BOW_POST_WALK_EXTRA_SETTLE_SEC)
-                pending_settle = 0.0
-            my_ap, bow_shots = self._fire_bow_burst(my_ap, me_cell)
-            if bow_shots > 0 and self.dist_tracker.tofu_detected:
-                print(f"  [tofu] bow connected ({bow_shots} shot(s)); "
-                      f"exiting retreat mode -- we can hit them at "
-                      f"range, no need to keep kiting back")
-                self.dist_tracker.tofu_detected = False
+        # Attraction from current cell: pulls the kiter in. Replaces the
+        # old bow burst. On a successful cast the kite is broken and we
+        # leave tofu mode.
+        if (self.state.snapshot().in_combat and me_cell
+                and my_ap >= ATTRACTION_AP_COST):
+            target = self._pick_attraction_target(me_cell, my_ap)
+            if target is not None:
+                if pending_settle > 0:
+                    time.sleep(pending_settle + ATTRACTION_POST_WALK_EXTRA_SETTLE_SEC)
+                    pending_settle = 0.0
+                self._cast_attraction(target.cell)
+                time.sleep(CAST_WAIT_SEC)
+                my_ap -= ATTRACTION_AP_COST
+                if self.dist_tracker.tofu_detected:
+                    print(f"  [tofu] attraction pulled id={target.id}; "
+                          f"exiting retreat mode -- the kite is broken")
+                    self.dist_tracker.tofu_detected = False
+
+        # Vital Punishment leftover-AP filler (see play_turn for rationale).
+        # Cast before retreat so the click lands on a stationary cell.
+        if (self.state.snapshot().in_combat and me_cell
+                and my_ap >= VITAL_AP_COST):
+            turns_since_vital = new_turn - self.last_vital_turn
+            if turns_since_vital >= VITAL_COOLDOWN_TURNS:
+                self._cast_vital_punishment(me_cell)
+                time.sleep(CAST_WAIT_SEC)
+                my_ap -= VITAL_AP_COST
+                self.last_vital_turn = new_turn
+                print(f"  [tofu] vital cast on turn {new_turn}; "
+                      f"ap_left~{my_ap} (next available turn "
+                      f"{new_turn + VITAL_COOLDOWN_TURNS})")
+            else:
+                print(f"  [tofu] vital: on cooldown ({turns_since_vital}/"
+                      f"{VITAL_COOLDOWN_TURNS})")
 
         if mp_remaining > 0 and me_cell:
             live = alive_enemies(self.state.snapshot())
@@ -647,83 +722,132 @@ class Sacrieur:
         print(f"  CAST Dissolution hotkey={DISSOLUTION_HOTKEY!r} self_cell={my_cell}")
         cast_at_cell(DISSOLUTION_HOTKEY, my_cell, self.cal)
 
-    def _cast_strength_punishment(self, my_cell):
-        print(f"  CAST Strength Punishment hotkey={BUFF_HOTKEY!r} self_cell={my_cell}")
+    def _cast_bold_punishment(self, my_cell):
+        print(f"  CAST Bold Punishment hotkey={BUFF_HOTKEY!r} self_cell={my_cell}")
         cast_at_cell(BUFF_HOTKEY, my_cell, self.cal)
 
-    def _cast_bow(self, target_cell):
-        print(f"  CAST Bow hotkey={BOW_HOTKEY!r} target_cell={target_cell}")
-        cast_at_cell(BOW_HOTKEY, target_cell, self.cal)
+    def _cast_vital_punishment(self, my_cell):
+        print(f"  CAST Vital Punishment hotkey={VITAL_HOTKEY!r} self_cell={my_cell}")
+        cast_at_cell(VITAL_HOTKEY, my_cell, self.cal)
 
-    # --- Bow targeting ---
+    def _cast_swap(self, target_cell):
+        print(f"  CAST Swap hotkey={SWAP_HOTKEY!r} target_cell={target_cell}")
+        cast_at_cell(SWAP_HOTKEY, target_cell, self.cal)
 
-    def _pick_bow_target(self, snap, me_cell, debug=False):
-        """Nearest alive enemy in [BOW_MIN_RANGE, BOW_MAX_RANGE] with
-        LoS, or None. LoS blockers = static_obstacles + other live
-        entities (excluding the target's own cell)."""
-        if not me_cell:
-            if debug:
-                print("  bow: no target -- me_cell unknown")
+    def _cast_attraction(self, target_cell):
+        print(f"  CAST Attraction hotkey={ATTRACTION_HOTKEY!r} "
+              f"target_cell={target_cell}")
+        cast_at_cell(ATTRACTION_HOTKEY, target_cell, self.cal)
+
+    # --- Attraction targeting ---
+
+    @staticmethod
+    def _same_iso_line(a, b):
+        """True iff `a` and `b` share an iso-grid axis -- the only
+        geometry Attraction accepts. In (u, v) coords (see cell_grid),
+        the four edge-step directions move along u xor v, so two cells
+        on the same axial line share either u or v."""
+        ua, va = cell_to_uv(a)
+        ub, vb = cell_to_uv(b)
+        return ua == ub or va == vb
+
+    def _pick_attraction_target(self, me_cell, my_ap):
+        """Nearest alive enemy that Attraction can pull, or None.
+
+        Attraction (slot 1, 3 AP) is line-only -- the target must share
+        an iso axis with us -- and needs LoS. Range [ATTRACTION_MIN_RANGE
+        .. ATTRACTION_MAX_RANGE]. Adjacent enemies are skipped: pulling
+        them is a no-op (they're already in melee, where Dissolution
+        wants them). LoS blockers = static obstacles + all other live
+        entities."""
+        if not me_cell or my_ap < ATTRACTION_AP_COST:
             return None
+        snap = self.state.snapshot()
         other_alive = {
             e.cell for e in snap.fight_entities.values()
             if e.alive and e.cell > 0 and e.id != snap.my_id
         }
         candidates = []
-        rejections = []
-        for e in snap.fight_entities.values():
-            if not e.alive or e.id == snap.my_id or e.cell <= 0:
-                continue
+        for e in alive_enemies(snap):
             d = cell_distance(me_cell, e.cell)
-            if d < BOW_MIN_RANGE or d > BOW_MAX_RANGE:
-                if debug:
-                    rejections.append(
-                        f"id={e.id} cell={e.cell} out-of-range(dist={d}, "
-                        f"need {BOW_MIN_RANGE}..{BOW_MAX_RANGE})"
-                    )
+            if d < max(2, ATTRACTION_MIN_RANGE) or d > ATTRACTION_MAX_RANGE:
+                continue
+            if not self._same_iso_line(me_cell, e.cell):
                 continue
             blockers = set(self.static_obstacles) | (other_alive - {e.cell})
             if not line_of_sight(me_cell, e.cell, blockers):
-                if debug:
-                    mob_blockers = sorted(other_alive - {e.cell})
-                    rejections.append(
-                        f"id={e.id} cell={e.cell} dist={d} LoS-blocked "
-                        f"(other_alive={mob_blockers}, "
-                        f"static_obstacles={len(self.static_obstacles)})"
-                    )
                 continue
             candidates.append((d, e))
         if not candidates:
-            if debug:
-                if rejections:
-                    print(f"  bow: no target -- {len(rejections)} enemies considered:")
-                    for r in rejections:
-                        print(f"    rejected {r}")
-                else:
-                    print("  bow: no target -- no alive enemies on the field")
             return None
         candidates.sort(key=lambda t: t[0])
-        return candidates[0][1]
+        target = candidates[0][1]
+        print(f"  attraction: target id={target.id} cell={target.cell} "
+              f"dist={candidates[0][0]} (line-aligned, LoS clear)")
+        return target
 
-    def _fire_bow_burst(self, my_ap, me_cell):
-        """Fire bow shots until AP < cost, no eligible target, or
-        combat ends. Returns (updated_ap, shots_fired)."""
-        shots = 0
-        while my_ap >= BOW_AP_COST:
-            snap = self.state.snapshot()
-            if not snap.in_combat:
-                return my_ap, shots
-            target = self._pick_bow_target(snap, me_cell, debug=(shots == 0))
-            if target is None:
-                return my_ap, shots
-            d = cell_distance(me_cell, target.cell)
-            print(f"  bow: targeting id={target.id} cell={target.cell} dist={d} "
-                  f"ap_before={my_ap}")
-            self._cast_bow(target.cell)
-            time.sleep(CAST_WAIT_SEC)
-            my_ap -= BOW_AP_COST
-            shots += 1
-        return my_ap, shots
+    # --- Swap targeting ---
+
+    def _pick_swap_target(self, me_cell, my_ap):
+        """Returns the enemy to swap with, or None.
+
+        Swap is worth casting iff:
+          - my_ap >= SWAP_MIN_AP (otherwise we won't have AP for the
+            follow-up Dissolution)
+          - exactly one alive enemy is adjacent to me (2+ means
+            Dissolution already hits multiple targets, no swap needed)
+          - that adjacent enemy has at least one OTHER alive enemy
+            adjacent to its own cell -- after swap we'll land in the
+            target's old cell and Dissolution will hit BOTH the
+            swap target (now in our old cell) and that other enemy."""
+        if not me_cell or my_ap < SWAP_MIN_AP:
+            return None
+        snap = self.state.snapshot()
+        # alive_enemies hides summons when real mobs are still up; using
+        # it here means we won't swap *with* a summon. Summons next to
+        # the swap target can still serve as Dissolution collateral, so
+        # the "nearby" check below stays broad over fight_entities.
+        adjacent = [
+            e for e in alive_enemies(snap)
+            if cell_distance(me_cell, e.cell) == 1
+        ]
+        if len(adjacent) != 1:
+            print(f"  swap: skip (adjacent_enemies={len(adjacent)}, "
+                  f"need exactly 1)")
+            return None
+        target = adjacent[0]
+        nearby = [
+            e for e in snap.fight_entities.values()
+            if e.alive and e.id != snap.my_id and e.id != target.id
+            and e.cell > 0
+            and cell_distance(target.cell, e.cell) == 1
+        ]
+        if not nearby:
+            print(f"  swap: skip (id={target.id} cell={target.cell} has "
+                  f"no other enemy adjacent to it -- swap wouldn't gain "
+                  f"a second Dissolution target)")
+            return None
+        print(f"  swap: 1 adjacent enemy id={target.id} cell={target.cell} "
+              f"and it has {len(nearby)} other enemy/ies adjacent "
+              f"(cells={[e.cell for e in nearby]}); casting swap "
+              f"(my_ap={my_ap} >= {SWAP_MIN_AP})")
+        return target
+
+    def _me_cell_after_swap(self, old_cell, target_cell):
+        """Resolve our cell after a swap cast. The proxy parses GA;4;
+        (Transposition) and updates my_cell, but the packet arrives a
+        few tens of ms after the click ack -- poll briefly for the
+        snapshot to reflect it. Fall back to target_cell (geometrically
+        exact: we land where the swap target was) if the wait times out."""
+        wait_for(self.state,
+                 lambda s: my_fight_cell(s) not in (None, old_cell),
+                 timeout=1.0)
+        snap_cell = my_fight_cell(self.state.snapshot())
+        if snap_cell and snap_cell != old_cell:
+            return snap_cell
+        print(f"  swap: proxy didn't surface new my_cell within 1.0s; "
+              f"predicting target_cell={target_cell}")
+        return target_cell
 
     # --- Obstacle hygiene ---
 

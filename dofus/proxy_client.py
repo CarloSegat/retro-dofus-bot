@@ -42,7 +42,11 @@ class Player:
 
 @dataclass
 class FightEntity:
-    """One combatant in an active fight, derived from GTM packets."""
+    """One combatant in an active fight, derived from GTM packets.
+
+    is_summon / summoner_id are stamped by the proxy from GA;181 history
+    (GTM itself has no in-band flag). Targeting code should prefer
+    non-summons -- see fighter.helpers.alive_enemies."""
     id: int
     cell: int = 0
     hp: int = 0
@@ -50,6 +54,8 @@ class FightEntity:
     mp: int = 0
     hp_max: int = 0
     alive: bool = True
+    is_summon: bool = False
+    summoner_id: int = 0
 
 
 @dataclass
@@ -68,6 +74,9 @@ class Snapshot:
     my_life_max: int = 0       # out-of-fight max HP (from server "As" stats packet)
     my_life_anchor_ms: int = 0 # unix ms when my_life was last set (regen basis)
     my_life_regen_ms: int = 0  # server-stated regen rate from "ILS" packet
+    pods: int = 0                 # current inventory weight (Ow packet)
+    pods_max: int = 0             # soft cap, no penalty below
+    pods_max_overweight: int = 0  # hard cap, movement blocked at/above
     sitting: bool = False      # true while /sit is active; halves effective regen
     fight_phase: str = "idle"
     mobs: dict = field(default_factory=dict)            # {cell: MobGroup}
@@ -173,6 +182,9 @@ class ProxyState:
                 my_life_max=self._snap.my_life_max,
                 my_life_anchor_ms=self._snap.my_life_anchor_ms,
                 my_life_regen_ms=self._snap.my_life_regen_ms,
+                pods=self._snap.pods,
+                pods_max=self._snap.pods_max,
+                pods_max_overweight=self._snap.pods_max_overweight,
                 sitting=self._snap.sitting,
                 fight_phase=self._snap.fight_phase,
                 mobs=dict(self._snap.mobs),
@@ -244,6 +256,9 @@ class ProxyState:
                 self._snap.my_life_max = ev.get("my_life_max", 0)
                 self._snap.my_life_anchor_ms = ev.get("my_life_anchor_ms", 0)
                 self._snap.my_life_regen_ms = ev.get("my_life_regen_ms", 0)
+                self._snap.pods = ev.get("pods", 0)
+                self._snap.pods_max = ev.get("pods_max", 0)
+                self._snap.pods_max_overweight = ev.get("pods_max_overweight", 0)
                 self._snap.fight_phase = ev.get("fight_phase", "idle")
                 self._snap.mobs = {
                     m["cell"]: MobGroup(
@@ -267,6 +282,8 @@ class ProxyState:
                         mp=e.get("mp", 0),
                         hp_max=e.get("hp_max", 0),
                         alive=e.get("alive", True),
+                        is_summon=e.get("is_summon", False),
+                        summoner_id=e.get("summoner_id", 0),
                     )
                     for e in ev.get("fight_entities") or []
                 }
