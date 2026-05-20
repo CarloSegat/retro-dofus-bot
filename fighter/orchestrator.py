@@ -29,6 +29,7 @@ from dofus.map_data import (
 )
 from dofus.proxy_client import ProxyState
 from fighter.combat import Combat, TurnContext  # noqa: F401 (re-exported)
+from fighter.death_watcher import DeathWatcher
 from fighter.engager import Engager, COMBAT_START_TIMEOUT
 from fighter.helpers import (
     IDLE_POLL_SEC,
@@ -190,6 +191,11 @@ class Orchestrator:
                   f"in farming area {self.args.farming_area['name']!r}; the "
                   f"bot may be unable to navigate until you walk back in")
         self.combat = Combat(self.state, self._ctx)
+        self.death_watcher = DeathWatcher(
+            self.state, self.navigator, on_aggro=self.combat.run,
+            farming_area_map_ids=area_map_ids,
+        )
+        self.state.on_event(self.death_watcher.on_proxy_event)
 
         # --- Wire callbacks (single source of truth) ---
         self.combat.on_fight_engaged(self.fighter.on_fight_engaged)
@@ -198,6 +204,7 @@ class Orchestrator:
         self.combat.on_turn_start(self._log_turn)
         self.combat.on_turn_end(self._log_turn_end)
         self.combat.on_fight_ended(self.inventory.on_fight_ended)
+        self.combat.on_fight_ended(self.death_watcher.on_fight_ended)
         self.combat.on_fight_ended(self._on_fight_ended)
 
         # Orchestrator-level state
@@ -295,6 +302,8 @@ class Orchestrator:
                   f"will press ready again next iteration")
 
     def _tick_idle(self, snap):
+        if self.death_watcher.try_recover():
+            return
         target = self.engager.find_target(snap)
         if target is None:
             wait_ms = self.engager.all_walking_groups_filtered(snap)
