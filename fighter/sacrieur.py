@@ -418,6 +418,7 @@ class Sacrieur:
         # Fight-scoped state -- reset on on_fight_engaged.
         self.last_buff_turn = -BUFF_COOLDOWN_TURNS
         self.last_vital_turn = -VITAL_COOLDOWN_TURNS
+        self.is_first_turn = True
         self.static_obstacles: set[int] = set()
         self.dist_tracker = TurnDistanceTracker(TOFU_THRESHOLD, TOFU_REQUIRED_CYCLES)
 
@@ -428,6 +429,7 @@ class Sacrieur:
         current map and prunes any that overlap live entities."""
         self.last_buff_turn = -BUFF_COOLDOWN_TURNS
         self.last_vital_turn = -VITAL_COOLDOWN_TURNS
+        self.is_first_turn = True
         map_id = snap.map_id
         self._prune_obstacles_from_entities(map_id, snap)
         self.static_obstacles = set(
@@ -440,8 +442,16 @@ class Sacrieur:
 
     def play_turn(self, ctx):
         """Body of one combat turn. Called via Combat.on_turn_start.
-        Calls pass_turn at the end -- Combat doesn't manage AP/MP."""
+        Calls pass_turn at the end -- Combat doesn't manage AP/MP.
+
+        First-turn special-casing: force Bold + Vital Punishment, skip
+        Attraction. The buff distance/AP gates exist to avoid wasting
+        AP mid-fight, but on T1 we definitely want both punishments
+        stacked before anything else (no contest for AP yet, and a fresh
+        buff is most valuable at the start)."""
         new_turn = ctx.turn_n
+        is_first_turn = self.is_first_turn
+        self.is_first_turn = False
         snap = ctx.snap
         me_cell = my_fight_cell(snap)
         me = snap.fight_entities.get(snap.my_id)
@@ -481,29 +491,54 @@ class Sacrieur:
         if not self.buff_enabled:
             pass
         elif buff_ready and me_cell and my_ap >= BUFF_AP_COST:
-            # If a Dissolution is firing this turn (enemy already adjacent),
-            # don't burn AP on the buff unless we'd still have enough left
-            # to also cast Dissolution. Otherwise the buff steals the hit
-            # -- exactly what happens under enemy AP-drain.
-            needed = BUFF_AP_COST + DISSOLUTION_AP_COST
-            if nearest_dist == 1 and my_ap < needed:
-                print(f"  buff: skip (adjacent enemy, ap={my_ap} < "
-                      f"buff+dissolution={needed}; preserving AP for Dissolution)")
-            elif nearest_dist <= BUFF_MAX_DIST:
-                print(f"  buff: nearest_dist={nearest_dist} <= {BUFF_MAX_DIST}, "
-                      f"cooldown ready (last_cast_turn={self.last_buff_turn}), casting")
+            if is_first_turn:
+                # T1: cast unconditionally -- distance and "preserve AP
+                # for Dissolution" gates don't apply when the fight has
+                # just started and there's no contest for AP yet.
+                print(f"  buff: T1 force-cast (bypassing distance + AP gates)")
                 self._cast_bold_punishment(me_cell)
                 time.sleep(CAST_WAIT_SEC)
                 my_ap -= BUFF_AP_COST
                 self.last_buff_turn = new_turn
-                print(f"  buff cast on turn {new_turn}; ap_left~{my_ap} "
-                      f"(next available turn {new_turn + BUFF_COOLDOWN_TURNS})")
+                print(f"  buff cast on turn {new_turn}; ap_left~{my_ap}")
             else:
-                print(f"  buff: nearest_dist={nearest_dist} > {BUFF_MAX_DIST}, "
-                      f"skipping (too far -- buff would expire before we get hit)")
+                # If a Dissolution is firing this turn (enemy already adjacent),
+                # don't burn AP on the buff unless we'd still have enough left
+                # to also cast Dissolution. Otherwise the buff steals the hit
+                # -- exactly what happens under enemy AP-drain.
+                needed = BUFF_AP_COST + DISSOLUTION_AP_COST
+                if nearest_dist == 1 and my_ap < needed:
+                    print(f"  buff: skip (adjacent enemy, ap={my_ap} < "
+                          f"buff+dissolution={needed}; preserving AP for Dissolution)")
+                elif nearest_dist <= BUFF_MAX_DIST:
+                    print(f"  buff: nearest_dist={nearest_dist} <= {BUFF_MAX_DIST}, "
+                          f"cooldown ready (last_cast_turn={self.last_buff_turn}), casting")
+                    self._cast_bold_punishment(me_cell)
+                    time.sleep(CAST_WAIT_SEC)
+                    my_ap -= BUFF_AP_COST
+                    self.last_buff_turn = new_turn
+                    print(f"  buff cast on turn {new_turn}; ap_left~{my_ap} "
+                          f"(next available turn {new_turn + BUFF_COOLDOWN_TURNS})")
+                else:
+                    print(f"  buff: nearest_dist={nearest_dist} > {BUFF_MAX_DIST}, "
+                          f"skipping (too far -- buff would expire before we get hit)")
         elif not buff_ready:
             print(f"  buff: on cooldown ({turns_since_buff}/{BUFF_COOLDOWN_TURNS} "
                   f"turns since last cast on turn {self.last_buff_turn})")
+
+        # T1 Vital: cast right after Bold so both punishments land before
+        # anything else competes for AP. With my_ap=6 (buff+vital=6) we
+        # spend the whole turn on buffs; with more AP, Dissolution still
+        # gets its turn below. Cast before walking so the self-click
+        # lands on a stationary cell.
+        if (is_first_turn and self.state.snapshot().in_combat and me_cell
+                and my_ap >= VITAL_AP_COST):
+            print(f"  vital: T1 force-cast (priority on punishments)")
+            self._cast_vital_punishment(me_cell)
+            time.sleep(CAST_WAIT_SEC)
+            my_ap -= VITAL_AP_COST
+            self.last_vital_turn = new_turn
+            print(f"  vital cast on turn {new_turn}; ap_left~{my_ap}")
 
         # Close on nearest enemy, then Dissolution if adjacent.
         nearest = enemies[0]
@@ -557,8 +592,9 @@ class Sacrieur:
         # cast per target per turn, and a single pull is usually enough to
         # bring the enemy adjacent for next turn's Dissolution). Clears
         # tofu_detected on a successful pull -- once they're glued to us
-        # the kite is broken.
-        if (self.state.snapshot().in_combat and me_cell
+        # the kite is broken. Skipped on T1: the punishments + Dissolution
+        # are higher priority before AP gets drained.
+        if (not is_first_turn and self.state.snapshot().in_combat and me_cell
                 and my_ap >= ATTRACTION_AP_COST):
             target = self._pick_attraction_target(me_cell, my_ap)
             if target is not None:
