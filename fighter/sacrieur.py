@@ -1,25 +1,25 @@
 """Sacrieur: per-turn brain plus class-specific spell knowledge.
 
-Owns the tofu detector (kiter retreat mode). play_turn(ctx) is the
-body of a single combat turn: walk, cast, attract, follow-up, pass.
-The class holds fight-scoped state (tofu detector, buff cooldown) that
-on_fight_engaged resets at the start of each fight.
+play_turn(ctx) is the body of a single combat turn: walk, cast,
+attract, follow-up, pass. The class holds fight-scoped state (tofu
+detector, buff cooldown) that on_fight_engaged resets at the start of
+each fight.
 
-Walking primitives (walk_toward, walk_away, try_full_walk, pick_next_step,
-pick_retreat_step) live in fighter.walking — class-agnostic, shared
-with Enutrof.
+Class-agnostic primitives are in sibling modules:
+  fighter.walking — walk_toward / walk_away / try_full_walk / picks
+  fighter.tofu    — TofuTracker (kiter detector) + retreat_from_nearest
 
 Wired via Combat.on_turn_start(sacrieur.play_turn) and
 Combat.on_fight_engaged(sacrieur.on_fight_engaged) in Orchestrator.
 """
-import random
 import time
 
 from dofus.actions import cast_at_cell, pass_turn
 from dofus.cell_grid import cell_distance, cell_to_uv, line_of_sight
 from dofus.map_data import save as save_map_data
 from fighter.helpers import alive_enemies, my_fight_cell, wait_for
-from fighter.walking import pick_retreat_step, walk_away, walk_toward
+from fighter.tofu import TofuTracker, retreat_from_nearest
+from fighter.walking import pick_retreat_step, walk_toward
 from utils import CFG
 
 
@@ -48,41 +48,6 @@ SWAP_POST_WALK_EXTRA_SETTLE_SEC = float(CFG.get("sacrid_swap_post_walk_settle_se
 CAST_WAIT_SEC = float(CFG.get("sacrid_cast_wait_sec", 0.8))
 PASS_TURN_HOTKEY = CFG.get("pass_turn_hotkey", "e")
 PASS_TURN_PRE_DELAY_SEC = float(CFG.get("pass_turn_pre_delay_sec", 1.5))
-TOFU_THRESHOLD = int(CFG.get("tofu_detect_threshold", 4))
-TOFU_REQUIRED_CYCLES = int(CFG.get("tofu_detect_required_cycles", 3))
-
-
-class TurnDistanceTracker:
-    """Detects hit-and-run "tofu-like" enemies via turn-start distances.
-
-    Called once per our turn-start with the distance to the nearest
-    alive enemy BEFORE we move. That snapshot is the cycle's "max" --
-    where the enemy ended up after retreating. If the last `required`
-    samples are all > `threshold` AND the sequence is not strictly
-    decreasing, flip tofu_detected. Sampling mid-cycle would conflate
-    enemy approach distance with our own post-move position."""
-
-    def __init__(self, threshold, required_cycles):
-        self.threshold = threshold
-        self.required = required_cycles
-        self.history = []
-        self.tofu_detected = False
-
-    def observe_turn_start(self, dist):
-        if dist is None or dist <= 0:
-            return None
-        self.history.append(dist)
-        if self.tofu_detected:
-            return dist
-        if len(self.history) >= self.required:
-            recent = self.history[-self.required:]
-            all_high = all(d > self.threshold for d in recent)
-            strictly_decreasing = all(
-                recent[i + 1] < recent[i] for i in range(len(recent) - 1)
-            )
-            if all_high and not strictly_decreasing:
-                self.tofu_detected = True
-        return dist
 
 
 # === Sacrieur class: spell choices + per-turn brain ===
@@ -107,7 +72,7 @@ class Sacrieur:
         self.last_vital_turn = -VITAL_COOLDOWN_TURNS
         self.is_first_turn = True
         self.static_obstacles: set[int] = set()
-        self.dist_tracker = TurnDistanceTracker(TOFU_THRESHOLD, TOFU_REQUIRED_CYCLES)
+        self.dist_tracker = TofuTracker()
 
     # --- Combat callbacks ---
 
@@ -125,7 +90,7 @@ class Sacrieur:
         if self.static_obstacles:
             print(f"  loaded {len(self.static_obstacles)} static obstacle(s) "
                   f"for map={map_id}")
-        self.dist_tracker = TurnDistanceTracker(TOFU_THRESHOLD, TOFU_REQUIRED_CYCLES)
+        self.dist_tracker = TofuTracker()
 
     def play_turn(self, ctx):
         """Body of one combat turn. Called via Combat.on_turn_start.
@@ -156,12 +121,13 @@ class Sacrieur:
                            if me_cell else None)
         recorded = self.dist_tracker.observe_turn_start(turn_start_dist)
         if recorded is not None:
+            required = self.dist_tracker.required
             print(f"  [tofu-track] turn-start dist={recorded} "
-                  f"(history={self.dist_tracker.history[-TOFU_REQUIRED_CYCLES:]})")
+                  f"(history={self.dist_tracker.history[-required:]})")
         if self.dist_tracker.tofu_detected and not was_tofu:
             print(f"  [tofu] hit-and-run pattern detected: last "
-                  f"{TOFU_REQUIRED_CYCLES} turn-start distances all "
-                  f"> {TOFU_THRESHOLD} and not strictly decreasing; "
+                  f"{self.dist_tracker.required} turn-start distances all "
+                  f"> {self.dist_tracker.threshold} and not strictly decreasing; "
                   f"switching to retreat mode for the rest of this fight")
 
         if self.dist_tracker.tofu_detected:
@@ -426,13 +392,9 @@ class Sacrieur:
         if mp_remaining > 0 and me_cell:
             live = alive_enemies(self.state.snapshot())
             if live:
-                anchor = live[0].cell
-                steps = random.randint(0, mp_remaining)
-                print(f"  [tofu] retreating {steps} step(s) away from "
-                      f"cell={anchor} (mp_left={mp_remaining})")
-                if steps > 0:
-                    walk_away(anchor, self.state, self.cal,
-                              self.static_obstacles, max_steps=steps)
+                retreat_from_nearest(self.state, self.cal,
+                                     self.static_obstacles, live[0].cell,
+                                     mp_remaining)
         if not self.state.snapshot().in_combat:
             return True
         print("  PASS (pass-turn hotkey)")
