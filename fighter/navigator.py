@@ -29,12 +29,20 @@ class MapNavigator:
     """Walks between calibrated maps. Stateless across maps except for
     per-session empty-map cooldown and last-direction bias."""
 
-    def __init__(self, state, cal, map_data, map_by_world, engager):
+    def __init__(self, state, cal, map_data, map_by_world, engager,
+                 farming_area_map_ids=None):
         self.state = state
         self.cal = cal
         self.map_data = map_data
         self.map_by_world = map_by_world
         self.engager = engager
+        # When set, travel() will only walk to targets whose map_id is in
+        # this set. None = free-roam (any calibrated neighbour). Used by
+        # the farming-area feature: pick once at startup, don't leave.
+        self.farming_area_map_ids = (
+            None if farming_area_map_ids is None
+            else {int(m) for m in farming_area_map_ids}
+        )
         # Last direction we walked through a switch cell. Used to bias
         # away from immediate backtracking when other options exist.
         self.last_walk_direction = None
@@ -83,6 +91,23 @@ class MapNavigator:
         switch_cells_map = entry.get("switch_cells") or {}
         self.mark_current_empty(snap)
         safe = safe_directions(entry, self.map_by_world) if switch_cells_map else []
+        # Farming-area filter: drop directions whose target map isn't in
+        # the chosen area. Logged once per filter event so the operator
+        # can see why a direction got skipped.
+        if self.farming_area_map_ids is not None and safe:
+            in_area = []
+            blocked = []
+            for d in safe:
+                tmid = target_map_id(entry, d, self.map_by_world)
+                if tmid is not None and tmid in self.farming_area_map_ids:
+                    in_area.append(d)
+                else:
+                    blocked.append((d, tmid))
+            if blocked:
+                print(f"[fighter] farming-area filter: skipping "
+                      f"{[(d, m) for d, m in blocked]} (target outside area); "
+                      f"keeping {in_area}")
+            safe = in_area
         now = time.time()
         self.recently_empty_maps = {
             mid: ts for mid, ts in self.recently_empty_maps.items()

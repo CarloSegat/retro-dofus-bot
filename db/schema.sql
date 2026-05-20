@@ -62,3 +62,24 @@ CREATE TABLE IF NOT EXISTS map_pois (
     PRIMARY KEY (map_id, poi_type, cell)
 );
 CREATE INDEX IF NOT EXISTS map_pois_by_type ON map_pois (poi_type);
+
+-- Farming areas: a named, strongly-connected subgraph of `maps`. At
+-- startup the bot picks one of these (or "free-roam"); MapNavigator
+-- then refuses to walk to a target outside the chosen area. Strong
+-- connectivity (every map reaches every other map via in-area
+-- switch_cells edges) is enforced by the Python API on create -- the
+-- DB doesn't enforce it because that would need recursive CTEs and
+-- it's cleaner to keep the rule next to the rest of the navigation
+-- logic.
+CREATE TABLE IF NOT EXISTS farming_areas (
+    area_id    SERIAL PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS farming_area_maps (
+    area_id INTEGER NOT NULL REFERENCES farming_areas(area_id) ON DELETE CASCADE,
+    map_id  INTEGER NOT NULL REFERENCES maps(map_id) ON DELETE CASCADE,
+    PRIMARY KEY (area_id, map_id)
+);
+CREATE INDEX IF NOT EXISTS farming_area_maps_by_map ON farming_area_maps (map_id);

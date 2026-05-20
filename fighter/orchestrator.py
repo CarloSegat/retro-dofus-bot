@@ -21,7 +21,12 @@ import mss
 
 from dofus.actions import pass_turn
 from dofus.inventory import Inventory
-from dofus.map_data import build_world_index, load_all as load_map_data
+from dofus.map_data import (
+    build_world_index,
+    get_farming_area,
+    list_farming_areas,
+    load_all as load_map_data,
+)
 from dofus.proxy_client import ProxyState
 from fighter.combat import Combat, TurnContext  # noqa: F401 (re-exported)
 from fighter.engager import Engager, COMBAT_START_TIMEOUT
@@ -72,11 +77,43 @@ def prompt_character_class():
         print(f"  unknown class {raw!r}; type 'sacrieur' or 'enutrof'")
 
 
+def prompt_farming_area():
+    """Ask which farming area to scope navigation to. Returns the area
+    dict (with area_id, name, map_ids) or None for free-roam.
+
+    No areas in the DB -> silently returns None (free-roam) so a fresh
+    install still works."""
+    areas = list_farming_areas()
+    if not areas:
+        return None
+    print("  available farming areas:")
+    for i, a in enumerate(areas, start=1):
+        print(f"    {i}. {a['name']!r} ({a['map_count']} map(s))")
+    print(f"    0. (free-roam -- no area constraint)")
+    while True:
+        raw = input(f"  pick farming area [0..{len(areas)}, default 0]: ").strip()
+        if not raw:
+            return None
+        try:
+            choice = int(raw)
+        except ValueError:
+            print(f"  not a number")
+            continue
+        if choice == 0:
+            return None
+        if 1 <= choice <= len(areas):
+            full = get_farming_area(areas[choice - 1]["area_id"])
+            return full
+        print(f"  out of range (0..{len(areas)})")
+
+
 def prompt_runtime_settings():
     """Interactive startup questions. Returns SimpleNamespace with
-    character_class, buff_enabled (Sacrieur only), max_group_size, min_hp."""
+    character_class, farming_area, buff_enabled (Sacrieur only),
+    max_group_size, min_hp."""
     print("[fighter] runtime settings (Enter for default):")
     character_class = prompt_character_class()
+    farming_area = prompt_farming_area()
     if character_class == CLASS_SACRIEUR:
         buff_enabled = prompt_yn("  cast Bold Punishment buff?",
                                  default=bool(CFG.get("sacrid_buff_enabled", True)))
@@ -90,6 +127,7 @@ def prompt_runtime_settings():
         default=int(CFG.get("min_hp_to_engage", 500)))
     return SimpleNamespace(
         character_class=character_class,
+        farming_area=farming_area,
         buff_enabled=buff_enabled,
         max_group_size=max_group_size,
         min_hp=min_hp,
@@ -142,8 +180,15 @@ class Orchestrator:
         self.engager = Engager(self.state, self.cal, self.hp_regen,
                                self.map_data, self.inventory,
                                max_group_size=self.args.max_group_size)
+        area_map_ids = (self.args.farming_area or {}).get("map_ids") \
+            if self.args.farming_area else None
         self.navigator = MapNavigator(self.state, self.cal, self.map_data,
-                                      self.map_by_world, self.engager)
+                                      self.map_by_world, self.engager,
+                                      farming_area_map_ids=area_map_ids)
+        if area_map_ids is not None and snap.map_id not in area_map_ids:
+            print(f"[fighter] WARNING: starting map_id={snap.map_id} is NOT "
+                  f"in farming area {self.args.farming_area['name']!r}; the "
+                  f"bot may be unable to navigate until you walk back in")
         self.combat = Combat(self.state, self._ctx)
 
         # --- Wire callbacks (single source of truth) ---
@@ -173,6 +218,12 @@ class Orchestrator:
                   f"ap_cost={COINS_AP_COST}")
         print(f"[fighter] min-hp threshold: wait until >= {self.args.min_hp} HP "
               f"before engaging")
+        if self.args.farming_area is not None:
+            fa = self.args.farming_area
+            print(f"[fighter] farming area: {fa['name']!r} "
+                  f"({len(fa['map_ids'])} map(s)) -- navigation constrained")
+        else:
+            print(f"[fighter] farming area: (free-roam, no constraint)")
         if self.args.max_group_size > 0:
             print(f"[fighter] max-group-size: skip mob groups with > "
                   f"{self.args.max_group_size} members")

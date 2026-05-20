@@ -318,3 +318,165 @@ def safe_directions(entry, by_world):
             continue
         out.append(direction)
     return out
+
+
+# === Farming areas ===
+
+def list_farming_areas():
+    """All farming areas, ordered by name. Each item:
+    {area_id, name, map_count}. Cheap list-view; use get_farming_area
+    when you need the full map set."""
+    conn = _get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT a.area_id, a.name, COUNT(m.map_id) AS map_count
+              FROM farming_areas a
+              LEFT JOIN farming_area_maps m USING (area_id)
+             GROUP BY a.area_id, a.name
+             ORDER BY a.name
+            """
+        )
+        return [
+            {"area_id": aid, "name": name, "map_count": int(cnt)}
+            for aid, name, cnt in cur.fetchall()
+        ]
+
+
+def get_farming_area(area_id):
+    """Full data for one area: {area_id, name, map_ids: set[int]}, or
+    None if no such area."""
+    conn = _get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT area_id, name FROM farming_areas WHERE area_id = %s",
+                    (int(area_id),))
+        row = cur.fetchone()
+        if not row:
+            return None
+        aid, name = row
+        cur.execute("SELECT map_id FROM farming_area_maps WHERE area_id = %s", (aid,))
+        map_ids = {int(r[0]) for r in cur.fetchall()}
+    return {"area_id": aid, "name": name, "map_ids": map_ids}
+
+
+def get_farming_area_by_name(name):
+    """Same shape as get_farming_area, looked up by name. None if absent."""
+    conn = _get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT area_id FROM farming_areas WHERE name = %s", (name,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    return get_farming_area(row[0])
+
+
+def is_strongly_connected(map_ids, map_data, by_world):
+    """Returns (ok, message). Strongly connected = every map in the set
+    can reach every other map traversing only switch_cells edges whose
+    target is also in the set. Forward BFS from one node must reach the
+    whole set, and so must backward BFS (every node points back at us).
+
+    `map_data` is the {map_id: entry} dict from load_all(); `by_world`
+    is build_world_index(map_data). Both are passed in (not loaded
+    here) because callers usually already have them.
+    """
+    targets = {int(m) for m in map_ids}
+    if len(targets) <= 1:
+        return True, "trivially connected (<=1 map)"
+    missing = [m for m in targets if m not in map_data]
+    if missing:
+        return False, f"unknown map_id(s) {missing} (not in maps table)"
+
+    # Build adjacency restricted to the area.
+    forward: dict[int, set[int]] = {m: set() for m in targets}
+    backward: dict[int, set[int]] = {m: set() for m in targets}
+    for m in targets:
+        entry = map_data[m]
+        world = entry.get("world")
+        if not (isinstance(world, (list, tuple)) and len(world) == 2):
+            continue
+        wx, wy = int(world[0]), int(world[1])
+        for direction in (entry.get("switch_cells") or {}):
+            delta = DIRECTION_WORLD_DELTA.get(direction)
+            if delta is None:
+                continue
+            nbr_entry = by_world.get((wx + delta[0], wy + delta[1]))
+            if nbr_entry is None:
+                continue
+            nbr_id = int(nbr_entry["map_id"])
+            if nbr_id not in targets:
+                continue
+            forward[m].add(nbr_id)
+            backward[nbr_id].add(m)
+
+    start = next(iter(targets))
+
+    def bfs(adj, root):
+        seen = {root}
+        q = deque([root])
+        while q:
+            cur = q.popleft()
+            for n in adj[cur]:
+                if n not in seen:
+                    seen.add(n)
+                    q.append(n)
+        return seen
+
+    fwd_reach = bfs(forward, start)
+    if fwd_reach != targets:
+        unreachable = sorted(targets - fwd_reach)
+        return False, (f"map {start} cannot reach map(s) {unreachable} via "
+                       f"in-area switch_cells (forward BFS)")
+    bwd_reach = bfs(backward, start)
+    if bwd_reach != targets:
+        cannot_reach_start = sorted(targets - bwd_reach)
+        return False, (f"map(s) {cannot_reach_start} cannot reach {start} via "
+                       f"in-area switch_cells (backward BFS)")
+    return True, f"{len(targets)} map(s) strongly connected"
+
+
+def create_farming_area(name, map_ids, map_data=None, by_world=None):
+    """Create a new farming area. Validates strong connectivity before
+    inserting; raises ValueError if the maps aren't all mutually
+    reachable inside the area.
+
+    Returns the new area_id.
+
+    If `map_data` / `by_world` are omitted, they're loaded on demand."""
+    if not name or not name.strip():
+        raise ValueError("name is required")
+    if not map_ids:
+        raise ValueError("at least one map_id is required")
+    name = name.strip()
+    targets = sorted({int(m) for m in map_ids})
+
+    if map_data is None:
+        map_data = load_all()
+    if by_world is None:
+        by_world = build_world_index(map_data)
+    ok, msg = is_strongly_connected(targets, map_data, by_world)
+    if not ok:
+        raise ValueError(f"farming area not strongly connected: {msg}")
+
+    conn = _get_conn()
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO farming_areas (name) VALUES (%s) RETURNING area_id",
+                (name,),
+            )
+            area_id = cur.fetchone()[0]
+            cur.executemany(
+                "INSERT INTO farming_area_maps (area_id, map_id) VALUES (%s, %s)",
+                [(area_id, m) for m in targets],
+            )
+    return int(area_id)
+
+
+def delete_farming_area(area_id):
+    """Remove a farming area and its map-membership rows. Returns True
+    if a row was deleted, False if no such area_id."""
+    conn = _get_conn()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM farming_areas WHERE area_id = %s", (int(area_id),))
+        return cur.rowcount > 0

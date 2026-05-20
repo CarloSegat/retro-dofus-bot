@@ -107,6 +107,41 @@ reads/writes only the DB. To (re)import the JSON snapshot:
 python3 -m scripts.import_map_data_to_db
 ```
 
+### Farming areas
+
+A **farming area** is a named, strongly-connected subset of calibrated
+maps. At startup `main.py` prompts which one to scope navigation to;
+`MapNavigator` then refuses to walk to a target outside the area.
+Empty selection (`0`) means free-roam.
+
+Tables:
+- `farming_areas (area_id, name UNIQUE, created_at)`
+- `farming_area_maps (area_id, map_id)` — N:N membership
+
+Strong connectivity (every map in the area reachable from every other
+map via in-area `switch_cells` edges) is enforced by `dofus.map_data.
+create_farming_area` on insert, not by the DB itself. Forward + backward
+BFS from one node; both must reach the whole set.
+
+Manage areas via the CLI:
+
+```
+# interactive create (lists calibrated maps, asks name + world coords,
+# validates connectivity, writes)
+python3 -m scripts.create_farming_area
+
+# list existing
+python3 -m scripts.create_farming_area --list
+
+# delete by name
+python3 -m scripts.create_farming_area --delete "Tofu Plains"
+```
+
+Public Python API in `dofus.map_data`: `list_farming_areas()`,
+`get_farming_area(area_id)`, `get_farming_area_by_name(name)`,
+`is_strongly_connected(map_ids, map_data, by_world)`,
+`create_farming_area(name, map_ids)`, `delete_farming_area(area_id)`.
+
 ## Running everything together
 
 ```bash
