@@ -217,6 +217,17 @@ func (p *Proxy) handleGame(client net.Conn) {
 		p.sessMu.Unlock()
 	}()
 
+	// Tell Python subscribers the upstream link is live. When either
+	// pipe goroutine returns the game session is over -- the Dofus
+	// client crashed, was kicked, or closed cleanly. Publish that
+	// loudly so the bot's log shows a clean "logged out at <time>"
+	// marker instead of just trailing silence.
+	p.events.Publish(map[string]interface{}{
+		"type":   "client_connected",
+		"remote": client.RemoteAddr().String(),
+		"ts":     time.Now().UnixMilli(),
+	})
+
 	done := make(chan struct{}, 2)
 	go func() {
 		p.pipe(upstream, client, C2S, Game, nil)
@@ -227,6 +238,12 @@ func (p *Proxy) handleGame(client net.Conn) {
 		done <- struct{}{}
 	}()
 	<-done
+	log.Printf("[proxy] game client disconnected: %s", client.RemoteAddr())
+	p.events.Publish(map[string]interface{}{
+		"type":   "client_disconnected",
+		"remote": client.RemoteAddr().String(),
+		"ts":     time.Now().UnixMilli(),
+	})
 }
 
 // Inject sends one packet to the game upstream as if the client had sent it.
