@@ -55,15 +55,73 @@ Deeper references:
   range, cast Attraction to pull it in for next turn. Pass. No target
   lock -- Dissolution doesn't care which mob it hits, so we re-pick
   nearest each turn. All targeting/AP from proxy GTM data, no screen
-  detection.
-- `calibrate_map_cells.py <world_x> <world_y> [N]` — per-map calibration.
-  Phase 1: click N (default 2) starting cells. Phase 2: click the
-  N/E/S/W switch-map cells (press `n` to skip a direction the map
-  lacks). Phase 3: click obstacle cells, Esc when done. Upserts a row
-  in the `maps` table and the per-cell child rows (`start_cells`,
-  `switch_cells`, `obstacles`) via `dofus.map_data.save()`. Depends on
-  `config.json.cell_calibration` being already populated and the
-  Postgres DB being reachable (see "Database" below).
+  detection. `--auto-reuse` skips every interactive prompt and loads
+  the settings saved by the previous run -- only used by the
+  orchestrator's in-bot restart path (see `scripts/restart_dofus.py`
+  below) after `os.execv`; a human at the terminal should never need
+  to pass it.
+- `calibrate_map_cells.py <world_x> <world_y> [N] [--screen NAME]` —
+  per-map calibration. Phase 1: click N (default 2) starting cells.
+  Phase 2: click the N/E/S/W switch-map cells (press `n` to skip a
+  direction the map lacks). Phase 3: click obstacle cells, Esc when
+  done. Upserts a row in the `maps` table and the per-cell child rows
+  (`start_cells`, `switch_cells`, `obstacles`) via
+  `dofus.map_data.save()`. Depends on the chosen screen's pixel
+  calibration in `config.json.cell_calibrations[<name>]` being
+  already populated (see `recalibrate_screen.py`) and the Postgres DB
+  being reachable (see "Database" below).
+- `recalibrate_screen.py <name> [--samples N]` — (re)fit the pixel
+  calibration for a named screen. The Dofus window size/position
+  depends on the visible environment (host laptop, docker VNC desktop,
+  etc.), so each environment needs its own entry under
+  `config.json[cell_calibrations][<name>]`. Click N (default 4)
+  walkable cells; each click registers (click_xy, walked-to-cell_id)
+  via the proxy's `my_cell` update, then `dofus.cell_grid.fit_calibration`
+  least-squares-fits origin + cell size. Saves with `fitted_at`
+  timestamp; sets `default_screen` if unset.
+- `calibrate_play_button.py <name>` — per-screen capture of the
+  Ankama Launcher PLAY-button pixel position. Listens for one
+  left-click via pynput; saves to
+  `config.json[restart_clicks][<name>][play_button]`. Required by
+  `restart_dofus.py` (below). Open the launcher and maximize it
+  before running, so the calibrated position matches what
+  `restart_dofus.py` will see post-restart.
+- `calibrate_post_launcher_clicks.py <name>` — captures the two
+  in-game click positions used after launcher PLAY: the server
+  card on "Choose a server" (`server_first`) and the character
+  card on "Choose your character" (`character_first`). Merged
+  into the same `config.json[restart_clicks][<name>]` entry that
+  `calibrate_play_button.py` writes to. Single click per slot;
+  press Enter between slots so navigation clicks (double-clicking
+  the server card to advance) don't get captured.
+- `scripts/restart_dofus.py [--screen NAME] [--no-character-click]` —
+  "nuke and restart" tool for when the Dofus client hangs (UI freeze,
+  even manual VNC input is dropped). Kills both the game and launcher
+  windows by their X11 window PIDs (SIGKILL), sweeps
+  `/tmp/.mount_Retro` for FUSE-mount survivors (the launcher binary
+  is named `zaap`, NOT anything matching the AppImage path),
+  relaunches the AppImage, waits + maximizes the launcher,
+  double-clicks PLAY, waits + double-clicks the server card, waits
+  + double-clicks the character card (skip with `--no-character-click`
+  when the character was mid-fight — the server auto-enters in that
+  case and the extra click would land on the map). All clicks use
+  `xdotool windowraise + windowactivate + click` without `--window`
+  so they propagate through Electron's nested renderer windows.
+  **Two entry points**: the CLI (above, for manual VNC recovery) and
+  a callable `restart_dofus_client(screen_name, ...)` consumed by
+  `fighter/orchestrator.py`'s `ProgressWatchdog`. When the watchdog
+  trips (idle no-progress or in-fight stale-turn), the orchestrator
+  calls `restart_dofus_client` and then `os.execv`-s `main.py` with
+  `--auto-reuse` so a fresh process resumes from the saved settings
+  -- no operator action required.
+- `calibrate_fight_ui_dismiss.py <name>` — per-screen capture of the
+  in-fight turn-order bar `<>` collapse toggle. Listens for one
+  left-click via pynput; saves to
+  `config.json[fight_ui_dismiss_clicks][<name>][collapse_turn_order]`.
+  Must be run during an active fight (the turn-order bar is only
+  visible mid-fight). `Orchestrator` clicks this position on every
+  `on_fight_engaged` so the bar doesn't overlap clickable map cells.
+  Missing entry = one-shot warning + no-op.
 - `nav_graph.py` — print the connectivity graph between calibrated
   maps. Use to spot missing return-cell calibrations.
 - `walk_to.py <world_x> <world_y>` — one-shot navigator. BFS over the
@@ -76,6 +134,23 @@ Deeper references:
 - `ignore_challenges_and_trades.py` — optional standalone helper that
   polls for trade/challenge popups and clicks Ignore. Runs in parallel
   to `main.py`.
+- `scripts/monitor_connectivity.py` — host-side internet probe. TCP-
+  connects to Cloudflare/Google/Quad9 DNS (port 53) every 5s; treats
+  "all 3 fail" as DOWN. Logs state transitions + periodic heartbeats
+  (UP and DOWN) to `logs/network.log` (daily rotation, 30 days kept).
+  Run once per HOST (not per container) -- internet outages affect
+  every bot at the same time, so one monitor catches them all. Pair
+  with `restart_history.jsonl` and `fighter.log` timestamps to prove
+  a bot trip was an external outage (router restart, ISP blip) and
+  not a bot bug:
+  ```bash
+  # start (host shell, not container)
+  nohup python3 -u scripts/monitor_connectivity.py >/dev/null 2>&1 &
+  # later: see all outages in the last week
+  grep -E "DOWN|UP -- " logs/network.log
+  # correlate with a watchdog trip at 14:32
+  awk '$2 >= "14:25:00" && $2 <= "14:35:00"' logs/network.log
+  ```
 
 ## One-time setup (Linux)
 
@@ -161,9 +236,174 @@ python3 -u main.py
 Run python with `-u` or stdout buffered through `tee` makes the bot
 look frozen.
 
+## Diagnosing a fuck-up after the fact
+
+When you come back to a bot that's stuck / logged out / sat in the
+character selection screen for hours, both halves write rotating
+logs under `<repo>/logs/<instance>/`:
+
+```
+logs/
+  desktop-1/                   # FIGHTER_INSTANCE
+    fighter.log                # live bot log
+    fighter.log.YYYY-MM-DD_HH-MM   # rotated chunks (10 min each, 24h)
+    proxy.log                  # live proxy log
+    proxy.log.YYYY-MM-DD_HH-MM
+  desktop-2/
+    ...
+  host/                        # default instance when run outside docker
+    ...
+```
+
+The convention is **one container per Dofus character**, so each
+`<instance>` subdirectory holds the full story for exactly one
+character. The bot prints a `[session] instance=<X> character=<Y>
+pid=<P>` banner once per process at startup, so a retrospective
+`grep <character-name> logs/*/fighter.log*` lands in the right
+subdir without already knowing which container ran them.
+
+- **Bot side** (`main.py` / `walk_to.py`):
+  `logs/<instance>/fighter.log` is the live file. Older 10-minute
+  chunks rotate to `fighter.log.YYYY-MM-DD_HH-MM`, keeping ~24h
+  (144 files). Configured in `fighter/logging_setup.py` --
+  every `print(...)` is teed through it, prefixed with
+  `YYYY-MM-DD HH:MM:SS`. Instance is picked from
+  `$FIGHTER_INSTANCE`, falling back to `socket.gethostname()` then
+  `host`. Character name comes from `$FIGHTER_CHARACTER` (banner
+  only -- not embedded in every line).
+- **Proxy side** (`sudo go run ./proxy/cmd/proxy ...`):
+  `logs/<instance>/proxy.log` with the same rotation shape.
+  `--log-dir`, `--log-interval`, `--log-backups`, `--instance`
+  flags override the defaults. Instance falls through to
+  `$FIGHTER_INSTANCE` then `os.Hostname()` then `host` -- matching
+  the Python side. Also still tees to stderr so `docker logs`
+  and interactive runs show the same lines live.
+
+**Important**: the proxy's `--log-dir` defaults to `$PWD/logs`.
+Always launch the proxy from the repo root, otherwise its logs
+land under `proxy/logs/<instance>/` instead of `logs/<instance>/`.
+The desktop container's `start.sh` passes `--log-dir
+/workspace/logs --instance "$FIGHTER_INSTANCE"` explicitly so
+nothing depends on cwd inside the container.
+
+If you change `FIGHTER_INSTANCE` or `FIGHTER_CHARACTER` in
+docker-compose.yml you MUST `docker compose up -d --force-recreate
+<service>` -- env-var changes don't apply to a running container.
+
+Diagnostic playbook:
+
+```bash
+# 1. Find the instance/character you care about
+grep -lE "\[session\] .*character=Marx-Rockfeller" logs/*/fighter.log*
+
+# 2. Newest chunks first within that instance
+ls -lt logs/desktop-1/
+
+# 3. Grep both sides for the disconnect markers we emit
+grep -nE "DISCONNECT|STALE|client_disconnected|game client disconnected" \
+    logs/desktop-1/fighter.log* logs/desktop-1/proxy.log*
+
+# 4. Were there any auto-restarts? (watchdog or stale-turn -> restart_dofus
+#    + execv). The history file is append-only and survives 24h log
+#    rotation -- safe to use after a long absence.
+cat logs/desktop-1/restart_history.jsonl
+
+# 5. For each trip, find the full snapshot block + the post-restart child
+grep -nE "watchdog\] === restart_everything|auto-restart child" \
+    logs/desktop-1/fighter.log*
+
+# 6. Pull the ~50 lines BEFORE the first DISCONNECT / trip in the chunk
+#    you care about -- that's the actual failure context. Don't read
+#    the whole 24h.
+less logs/desktop-1/fighter.log.2026-05-22_14-30
+```
+
+What the markers mean:
+
+- `[proxy-eyes] DISCONNECT: Dofus client closed the upstream session ...`
+  -- Python side; fired the instant the Go proxy sees the Dofus<->Ankama
+  TCP socket close. This is the most authoritative "I just got logged
+  out" signal.
+- `[proxy] game client disconnected: ...` -- same event from the Go
+  side; pair it with the matching `[proxy-eyes]` line by timestamp.
+- `[proxy-eyes] DISCONNECT: connection lost ...` /
+  `proxy closed the event socket` -- the bot lost the proxy itself
+  (proxy crashed / sudo died / network blip).
+- `[proxy-eyes] STALE: no proxy events for 123s ...` -- proxy is up
+  and the event hub is connected, but no game traffic for ~2 min.
+  Usually the Dofus client is frozen but hasn't dropped its TCP
+  session yet (e.g. spinning on a popup, anti-cheat ban screen, OOM).
+- `[watchdog] no progress for Xs / Ys; map=N last_engage=...` --
+  periodic "still idling" breadcrumb. One per threshold/4 seconds
+  while stuck. Survives across rotated chunks so a long flat stretch
+  leaves a trail, not a single line.
+- `[watchdog] TRIPPED: ...` -- the no-progress threshold was crossed.
+  Immediately followed by `=== restart_everything BEGIN ===`, a
+  multi-line labeled snapshot dump (connected / my_id / map_id /
+  fight_phase / hp / engager-filter state / etc.), a JSONL append
+  to `restart_history.jsonl`, then the `=== restart_everything END
+  ===` line right before `os.execv` kills this pid.
+- `[combat] StaleClientError: no GTS for Ns ...` -- in-fight
+  variant: Combat raised, Orchestrator caught, same restart flow
+  fires. Look just above for the last successful turn number.
+- `[session] auto-restart child (pid=...): ...` -- next pid's
+  startup banner; pairs 1:1 with a prior `restart_everything` block
+  in the previous pid's tail. Use this to chain "fresh start -> trip
+  -> child -> trip -> child" across hours. Immediately followed by a
+  triage block: `[session] restart_history.jsonl: N total trip(s), M
+  in the last 1h` and the last 5 trips inline -- so an SSH-tail
+  shows the thrash story on the first screen.
+- `[watchdog] !! restart loop suspected: N trips in last 60 min ...`
+  -- soft warning at `LOOP_WARN_TRIPS` trips/hour (default 3). Bot
+  keeps restarting but the line is grep-magnetic.
+- `[watchdog] !!! RUNAWAY RESTART LOOP: ... refusing to execv yet
+  again ... exiting non-zero` -- hard stop at `LOOP_HARDSTOP_TRIPS`
+  trips/hour (default 10). Process exits with code 99 after a 60s
+  beat. The fix is upstream (calibration, account ban, dead
+  launcher); flat-out restarting just burns the AppImage. Look at
+  the previous trip blocks in fighter.log and the corresponding
+  `restart_history.jsonl` rows to diagnose.
+
+If none of the markers fire but the bot still misbehaves, the failure
+is in-game logic (stuck on a popup, navigation dead-end, etc.) and
+the relevant evidence is the last `[fighter]` / `[orchestrator]` /
+`[combat]` lines before the symptom appeared.
+
+### `logs/<instance>/restart_history.jsonl`
+
+Append-only, one JSON row per watchdog trip. Written from
+`Orchestrator._append_restart_history` immediately before `os.execv`.
+Unlike `fighter.log` it is NOT rotated, so months of history is
+greppable in one place. Each row carries:
+
+  ts, iso, pid, reason, character, instance, screen, map_id, my_id,
+  my_cell, fight_phase, my_life, my_life_max, estimated_life,
+  last_engage_ts, last_fight_end_ts, last_event_ts
+
+Quick scans:
+
+```bash
+# How many restarts in this instance, ever?
+wc -l logs/desktop-1/restart_history.jsonl
+
+# Last 5 trips with reason + map_id
+tail -5 logs/desktop-1/restart_history.jsonl | \
+    jq -r '"\(.iso)  map=\(.map_id)  \(.reason)"'
+
+# Trips since yesterday morning
+awk -F'"ts": ' '$2+0 > 1716508800' logs/desktop-1/restart_history.jsonl
+```
+
 ## Config knobs (config.json)
 
-- `cell_calibration`: pixel-to-cell transform. Don't hand-edit.
+- `cell_calibrations`: dict of `{<screen_name>: {origin_x, origin_y,
+  cell_w, cell_h, residual_px, samples, fitted_at}}`. One entry per
+  visible-environment (host vs docker desktop vs ...). Don't
+  hand-edit; produced by `recalibrate_screen.py <name>`.
+- `default_screen`: which key in `cell_calibrations` to use when
+  neither `--screen` nor `FIGHTER_SCREEN` is supplied. The desktop
+  container sets `FIGHTER_SCREEN=docker_ubuntu` in `docker-compose.yml`
+  so the bot picks the docker fit automatically inside the VNC desktop.
 - `pass_turn_hotkey`: single key name, default `"e"`.
 - `sacrid_dissolution_hotkey`: key for Dissolution slot (e.g. `"2"`).
   **Required** — `main.py` refuses to start if empty. Dissolution is a
@@ -240,6 +480,19 @@ look frozen.
 - `sacrid_swap_post_walk_settle_sec`: extra sleep ADDED to
   `pending_settle` before the swap hotkey press when we just walked
   (default 0.33). Same drop mechanism as Dissolution.
+- **Escape swap** (no extra knobs -- reuses `sacrid_swap_*`): runs at
+  the END of the turn, after Bold + Vital + Attraction have had their
+  chance, when `SWAP_AP_COST <= my_ap < DISSOLUTION_AP_COST` (i.e. we
+  can't fit another Dissolution but still have 2-3 AP). If at least
+  one enemy is adjacent, we pick the adjacent-enemy cell whose iso
+  (u, v) L1 distance to the enemy centroid is greatest, and swap into
+  it -- trading the leftover AP for a step away from the cluster
+  reduces incoming damage next round. Skipped if <2 alive enemies
+  (centroid degenerates) or if no adjacent enemy cell strictly beats
+  our current distance from the centroid. The `sacrid_swap_min_ap`
+  floor (default 6) does NOT gate this -- that floor only applies to
+  the setup-swap (which needs to leave AP for Dissolution); the
+  escape-swap is explicitly the low-AP branch.
 - `sacrid_cast_wait_sec`: pause after each cast so the proxy `GTM`
   update with the new AP/HP arrives (default 0.8).
 - `enutrof_coins_hotkey`: spell slot for Coins Throwing, default `"1"`.
@@ -276,6 +529,48 @@ look frozen.
   free-shooting us at max range. Sampling has to happen pre-move --
   mid-cycle distance is polluted by our own MP spend and would
   falsely trip the detector every fight. Defaults 4/3.
+- `restart_clicks`: dict of `{<screen_name>: {play_button: [x, y],
+  calibrated_at}}`. Pixel position of the Ankama Launcher PLAY button
+  used by `restart_dofus.py` (the standalone client-restart tool).
+  Captured by `calibrate_play_button.py <name>`; each docker desktop
+  / host environment needs its own entry. Missing entry →
+  `restart_dofus.py` hard-errors with a pointer to the calibration
+  script.
+- `fight_ui_dismiss_clicks`: dict of `{<screen_name>:
+  {collapse_turn_order: [x, y], calibrated_at}}`. Pixel position of
+  the in-fight turn-order bar `<>` collapse toggle. `Orchestrator`
+  clicks it on every `on_fight_engaged` so the expanded bar doesn't
+  overlap clickable map cells in the top-right. Captured by
+  `calibrate_fight_ui_dismiss.py <name>` (run during a fight, so the
+  bar is visible). Missing entry → one-shot warning + no-op.
+  Assumption: Dofus resets the bar to expanded at the start of each
+  fight; if it turns out to be sticky across fights, add a per-session
+  guard inside `Orchestrator._dismiss_fight_ui`.
+- **In-fight cell click offsets (no config knob)**: a permanent
+  bottom-right UI panel covers cells 462 and 463 during fights. Their
+  geometric center lands inside the panel, so `dofus.cell_grid.
+  cell_to_screen_fight()` applies a hardcoded offset
+  (`FIGHT_CELL_CLICK_OFFSETS_PCT`: 462 → 25% of cell_w left, 463 →
+  25% of cell_h up) for the fight-only click sites (`cast_at_cell` and
+  all of `fighter/walking.py`). Out-of-fight `click_cell` keeps using
+  `cell_to_screen` directly — the panel isn't drawn then.
+- `turn_wait_timeout_sec`: seconds Combat waits for our next `GTS`
+  before declaring the turn stale (default 180). The server's
+  enforced per-turn timer is 29s, so 180s covers ~6 stuck enemy
+  turns or two badly-frozen single turns. On stale-turn Combat raises
+  `StaleClientError` (from `fighter/watchdog.py`); `Orchestrator.
+  _tick_combat` catches it and routes to `_restart_everything` --
+  same path the idle `ProgressWatchdog` uses. No more `sys.exit(1)`
+  pointing the operator at the manual script -- the bot self-heals.
+- `watchdog_idle_no_progress_sec`: out-of-fight no-progress threshold
+  in seconds (default 300). `ProgressWatchdog` watches the snapshot
+  signature `(map_id, last_fight_engage_ts, last_fight_end_ts,
+  estimated_life())`. `estimated_life()` ticks continuously during
+  sit-regen (server ILS rate), so a bot legitimately healing for 10+
+  minutes does NOT false-positive -- the metric resets the timer.
+  Trip = kill + relaunch Dofus client + `os.execv` `main.py
+  --auto-reuse`. Bump if real "i'm just thinking" plateaus (heavy
+  navigation pathing on big graphs?) start tripping.
 
 ## Things that have bitten us
 
@@ -290,3 +585,12 @@ look frozen.
 - **`GA;905;<actorId>;` is engage, NOT fight-end.** See
   `docs/proxy_protocol.md` for the full timing story.
 - See `docs/cell_geometry.md` for the cell-formula trap.
+
+## Working on this repo with Claude
+
+- **Plan files end with an executive summary.** Every plan written
+  under `~/.claude/plans/<slug>.md` (from Claude Code's plan mode)
+  must close with a `## Executive summary` section: 3-5 bullets that
+  name the concrete files / functions changed and the single most
+  important caveat. The user reads the bottom first to approve --
+  skipping the summary forces them to skim the whole plan.
