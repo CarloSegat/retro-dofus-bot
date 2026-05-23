@@ -1,4 +1,4 @@
-mss
+mss<10  # 10.x rejects TigerVNC's root visual (id not in depth-24 list) and crashes at init
 numpy
 pynput
 pytesseract
