@@ -42,7 +42,10 @@ services:
   #            or VNC viewer -> localhost:5901
   desktop:
     build:
-      context: ./desktop
+      # Repo root so the Dockerfile can COPY requirements.txt from the
+      # top level (desktop/-relative symlinks were rejected by buildx).
+      context: .
+      dockerfile: desktop/Dockerfile
       args:
         USER_UID: "1000"
         USER_GID: "1000"
@@ -55,25 +58,40 @@ services:
       # Inside this container, 127.0.0.1 is the container itself, not
       # the host's Postgres port-forward.
       MAP_DB_URL: postgresql://auto:auto@db:5432/auto_fighter
-      # mss's default XShmGetImage backend trips on TigerVNC's
-      # duplicate-depth-24 visual list ("drawable's visual not found
-      # in screen's supported visuals"). xgetimage is the same XCB
-      # backend without the XShm-init probe -- minor speed cost,
-      # which we don't care about (bot drives off proxy data, not
-      # screen capture). Default ("default") stays correct on the
-      # host's real X server.
-      MSS_BACKEND: xgetimage
+      # Pick the pixel calibration from config.json[cell_calibrations].
+      # The host and the VNC desktop have different window geometries,
+      # so each needs its own fitted calibration. Run
+      # `python3 recalibrate_screen.py noVNC` once inside this
+      # container to populate the entry; main.py picks it up via this
+      # env var (overridden by --screen on the CLI).
+      FIGHTER_SCREEN: noVNC
+      # Tags this container's log subdirectory (logs/<instance>/) so
+      # per-bot deaths/crashes are easy to grep without sifting through
+      # interleaved lines from sibling containers sharing /workspace/logs.
+      # Convention: one container per Dofus character, so this value is
+      # also a 1:1 stand-in for the character. After changing this env,
+      # `docker compose up -d --force-recreate <service>` is required --
+      # docker doesn't apply env changes to an already-running container.
+      FIGHTER_INSTANCE: desktop-1
+      # In-game character name running in this container. Surfaced in
+      # the [session] banner the bot prints at startup so retrospective
+      # `grep <name> logs/<instance>/*` finds the right files. Edit this
+      # if you swap accounts for this container.
+      FIGHTER_CHARACTER: marx-rockfeller
     ports:
       - "127.0.0.1:5901:5901"
       - "127.0.0.1:6080:6080"
     volumes:
       - .:/workspace
-      # Persist the Dofus Retro / Ankama Launcher install and config
-      # (saved credentials, in-game settings, character keybinds,
-      # XFCE desktop state, etc.) so `docker compose down` + `up`
-      # doesn't wipe them. Dofus stores everything under ~/.config/
-      # (Electron convention on Linux), NOT ~/.local/share/.
-      - dofus_user_config:/home/bot/.config
+      # Persist saved Dofus/Ankama credentials + in-game prefs across
+      # `docker compose down` + `up`. Mount only the app-specific
+      # subdirs of ~/.config -- mounting the whole ~/.config wipes the
+      # XFCE/dbus/Thunar defaults that the Electron desktop needs to
+      # bootstrap (xfce4-session "Unable to load a failsafe session").
+      - dofus_retro_config:/home/bot/.config/Dofus Retro
+      - ankama_launcher_config:/home/bot/.config/Ankama Launcher
+      - ankama_config:/home/bot/.config/Ankama
+      - zaap_config:/home/bot/.config/zaap
       # Inherit host wall-clock timezone. Containers already share the
       # host's monotonic clock via the kernel, so UTC time is correct
       # automatically -- this is just so log timestamps, in-game time,
@@ -93,6 +111,94 @@ services:
     security_opt:
       - apparmor:unconfined
 
+  # Extra desktop containers for additional Dofus client / bot instances.
+  # Each gets its own loopback + /etc/hosts (no proxy interference),
+  # shifted VNC ports, and separate credential volumes for a distinct account.
+  desktop2:
+    build:
+      context: .
+      dockerfile: desktop/Dockerfile
+      args:
+        USER_UID: "1000"
+        USER_GID: "1000"
+    container_name: auto-fighter-desktop-2
+    restart: unless-stopped
+    environment:
+      VNC_PASSWORD: ${VNC_PASSWORD:-secret}
+      VNC_GEOMETRY: ${VNC_GEOMETRY:-1280x800}
+      MAP_DB_URL: postgresql://auto:auto@db:5432/auto_fighter
+      FIGHTER_SCREEN: noVNC
+      FIGHTER_INSTANCE: desktop-2
+      # In-game character name -- see desktop-1 for rationale. Change
+      # this when assigning a different account to this container.
+      FIGHTER_CHARACTER: woonzypop
+    ports:
+      - "127.0.0.1:5902:5901"
+      - "127.0.0.1:6081:6080"
+    volumes:
+      - .:/workspace
+      - dofus_retro_config_2:/home/bot/.config/Dofus Retro
+      - ankama_launcher_config_2:/home/bot/.config/Ankama Launcher
+      - ankama_config_2:/home/bot/.config/Ankama
+      - zaap_config_2:/home/bot/.config/zaap
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    shm_size: "1gb"
+    devices:
+      - "/dev/fuse"
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+
+  desktop3:
+    build:
+      context: .
+      dockerfile: desktop/Dockerfile
+      args:
+        USER_UID: "1000"
+        USER_GID: "1000"
+    container_name: auto-fighter-desktop-3
+    restart: unless-stopped
+    environment:
+      VNC_PASSWORD: ${VNC_PASSWORD:-secret}
+      VNC_GEOMETRY: ${VNC_GEOMETRY:-1280x800}
+      MAP_DB_URL: postgresql://auto:auto@db:5432/auto_fighter
+      FIGHTER_SCREEN: noVNC
+      FIGHTER_INSTANCE: desktop-3
+      # In-game character name -- see desktop-1 for rationale. Change
+      # this when assigning a different account to this container.
+      FIGHTER_CHARACTER: unset
+    ports:
+      - "127.0.0.1:5903:5901"
+      - "127.0.0.1:6082:6080"
+    volumes:
+      - .:/workspace
+      - dofus_retro_config_3:/home/bot/.config/Dofus Retro
+      - ankama_launcher_config_3:/home/bot/.config/Ankama Launcher
+      - ankama_config_3:/home/bot/.config/Ankama
+      - zaap_config_3:/home/bot/.config/zaap
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    shm_size: "1gb"
+    devices:
+      - "/dev/fuse"
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+
 volumes:
   auto_fighter_pgdata:
-  dofus_user_config:
+  dofus_retro_config:
+  ankama_launcher_config:
+  ankama_config:
+  zaap_config:
+  dofus_retro_config_2:
+  ankama_launcher_config_2:
+  ankama_config_2:
+  zaap_config_2:
+  dofus_retro_config_3:
+  ankama_launcher_config_3:
+  ankama_config_3:
+  zaap_config_3:

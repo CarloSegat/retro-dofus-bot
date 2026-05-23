@@ -12,6 +12,12 @@ VNC_PORT="$((5900 + VNC_NUM))"
 
 mkdir -p "$HOME/.vnc"
 
+# Docker creates named-volume mountpoints as root. The four Dofus/Ankama
+# config volumes mount under ~/.config, which also leaves ~/.config itself
+# root-owned -- XFCE then can't write its session state and crashes with
+# "Unable to load a failsafe session". Reclaim ownership before VNC starts.
+sudo chown -R bot:bot "$HOME/.config" || true
+
 # Password file. VNC truncates to 8 chars silently; that is fine
 # for a localhost-only bind, but worth knowing.
 # Ubuntu 22.04's `tigervnc-common` does NOT ship a standalone passwd
@@ -46,7 +52,13 @@ chmod +x "$HOME/.vnc/xstartup"
 # ---------------------------------------------------------------------------
 PROXY_SRC=/workspace/proxy
 PROXY_BIN=/home/bot/auto-fighter-proxy
-PROXY_LOG=/tmp/proxy.log
+# Per-instance log directory under the bind-mounted /workspace/logs.
+# The proxy itself creates the subdir; we just need to point its
+# --log-dir at /workspace/logs and pass --instance through. The Go
+# proxy will produce /workspace/logs/<instance>/proxy.log; stderr is
+# captured to a small bootstrap-only file so `docker logs` and post-
+# mortems still see the early "starting" / "build failed" lines.
+PROXY_BOOTSTRAP_LOG=/tmp/proxy.bootstrap.log
 
 if [[ -d "${PROXY_SRC}" ]]; then
     echo "[start] building proxy from ${PROXY_SRC}"
@@ -61,9 +73,17 @@ if [[ -d "${PROXY_SRC}" ]]; then
         echo "[start] launching proxy on 127.0.0.1:443 + 127.0.0.2:443 (sudo, bg)"
         # `setsid` detaches from this script's process group so docker stop
         # signals don't take the proxy with the VNC bridge.
-        sudo -b setsid "${PROXY_BIN}" --events 127.0.0.1:9999 \
-            > "${PROXY_LOG}" 2>&1 || \
-            echo "[start] WARN: proxy launch failed -- see ${PROXY_LOG}"
+        # --log-dir /workspace/logs + --instance "$FIGHTER_INSTANCE" lands
+        # the rotating proxy.log at /workspace/logs/<instance>/proxy.log,
+        # next to fighter.log for the same instance. -E preserves the env
+        # vars across sudo so the proxy can also read FIGHTER_INSTANCE
+        # from the environment if --instance is empty.
+        sudo -bE setsid "${PROXY_BIN}" \
+            --events 127.0.0.1:9999 \
+            --log-dir /workspace/logs \
+            --instance "${FIGHTER_INSTANCE:-}" \
+            > "${PROXY_BOOTSTRAP_LOG}" 2>&1 || \
+            echo "[start] WARN: proxy launch failed -- see ${PROXY_BOOTSTRAP_LOG}"
     else
         echo "[start] WARN: proxy build failed -- skipping hosts hijack + proxy launch"
         echo "[start]       Zaap will talk to Ankama directly; bot won't see traffic."

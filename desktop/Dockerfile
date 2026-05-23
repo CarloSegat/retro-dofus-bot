@@ -78,12 +78,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         # installed inside the container (psycopg, pyautogui, etc.).
         python3 \
         python3-pip \
+        # pynput's evdev dep compiles a C extension; install the
+        # prebuilt apt package instead of dragging gcc + python3-dev
+        # into the image just for that.
+        python3-evdev \
         # Go toolchain to build the MITM proxy at container start.
         # Ubuntu 22.04 ships Go 1.18, which matches proxy/go.mod.
         golang-go \
         # `ip` from iproute2 -- used by proxy/setup-hosts.sh to add the
         # 127.0.0.2/8 loopback alias (best-effort: needs NET_ADMIN).
         iproute2 \
+        # Tesseract CLI for vision/popup OCR. The pytesseract Python
+        # package only wraps the binary; without `tesseract` on PATH
+        # the post-fight ensure_safe_to_resume check crashes with
+        # TesseractNotFoundError.
+        tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Firefox from the official Mozilla apt repo. The default Ubuntu 22.04
@@ -107,14 +116,21 @@ RUN groupadd -g ${USER_GID} bot && \
     useradd  -m -u ${USER_UID} -g ${USER_GID} -s /bin/bash bot && \
     echo "bot ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/bot
 
-COPY --chown=bot:bot start.sh /usr/local/bin/start.sh
+COPY --chown=bot:bot desktop/start.sh /usr/local/bin/start.sh
 RUN chmod +x /usr/local/bin/start.sh
+
+# Bake the bot's Python deps into the image so they survive container
+# recreation. Without this, `pip install -r requirements.txt` writes
+# into the container's writable layer and is wiped on every
+# `docker compose up -d --build` / volume change.
+COPY --chown=bot:bot requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
 # Bake the Dofus Retro installer (Zaap launcher) into the image.
 # FUSE is wired up via /dev/fuse + SYS_ADMIN in docker-compose.yml,
 # so the AppImage self-mounts and runs the same way it does on a
 # regular desktop Ubuntu host -- no extract step needed.
-COPY --chown=bot:bot Retro-Setup-x86_64.AppImage /opt/dofus/Retro-Setup-x86_64.AppImage
+COPY --chown=bot:bot desktop/Retro-Setup-x86_64.AppImage /opt/dofus/Retro-Setup-x86_64.AppImage
 RUN chmod +x /opt/dofus/Retro-Setup-x86_64.AppImage
 
 USER bot

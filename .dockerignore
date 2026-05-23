@@ -1,0 +1,33 @@
+# Keep the desktop build context small. The Dockerfile only needs
+# requirements.txt, desktop/start.sh, and desktop/Retro-Setup-x86_64.AppImage.
+# Everything else is bind-mounted at /workspace at runtime instead.
+.git
+.gitignore
+__pycache__
+*.pyc
+.venv
+venv
+data
+map_data
+db
+scripts
+proxy
+dofus
+fighter
+mouse_keyboard
+vision
+docs
+*.md
+*.json
+*.png
+*.jpg
+*.log
+docker-compose.yml
+main.py
+walk_to.py
+nav_graph.py
+recalibrate_screen.py
+calibrate_*.py
+visualize_map.py
+test_*.py
+ignore_challenges_and_trades.py
