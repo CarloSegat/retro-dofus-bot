@@ -22,10 +22,11 @@ from mouse_keyboard import press_focused
 from utils import CFG
 from vision import ensure_safe_to_resume
 from fighter.helpers import wait_for, append_fight_stats, STATS_FILE
+from fighter.watchdog import StaleClientError
 
 
 TURN_START_SETTLE_SEC = float(CFG.get("turn_start_settle_sec", 1.5))
-TURN_WAIT_TIMEOUT_SEC = float(CFG.get("turn_wait_timeout_sec", 90.0))
+TURN_WAIT_TIMEOUT_SEC = float(CFG.get("turn_wait_timeout_sec", 180.0))
 POST_FIGHT_PRE_WAIT_SEC = 4.0  # let level-up + XP-summary popups render
 POST_FIGHT_RETURN_TO_ESC_GAP = 1.0
 
@@ -94,6 +95,10 @@ class Combat:
         while self.state.snapshot().in_combat:
             new_turn = self._wait_for_my_turn(my_id, last_turn_n)
             if new_turn == 0:
+                if self.state.snapshot().in_combat:
+                    raise StaleClientError(
+                        f"no GTS for {TURN_WAIT_TIMEOUT_SEC:.0f}s while "
+                        f"still in_combat -- Dofus client likely frozen")
                 break
             print(f"  TURN {new_turn} start (actor={my_id}); settling "
                   f"{TURN_START_SETTLE_SEC}s before acting")
