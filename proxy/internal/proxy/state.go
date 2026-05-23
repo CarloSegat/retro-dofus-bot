@@ -294,6 +294,15 @@ func (s *stateTracker) Apply(pkt string) {
 		// shop; consumers listen for this event to dismiss it.
 		// Digit-guard so we don't match hypothetical future "ECKE" etc.
 		s.applyExchangeOpen(pkt[3:])
+	case len(pkt) >= 3 && strings.HasPrefix(pkt, "DQ") && pkt[2] >= '0' && pkt[2] <= '9':
+		// DQ<questionId>[;<npcId>]|<replyId>;<replyId>;... -- NPC dialog
+		// question opened. The bot occasionally clicks a cell occupied by
+		// an NPC while engaging mobs; that opens the NPC's dialog and
+		// blocks all follow-ups until dismissed. Consumers listen for this
+		// event to press Esc. Server emits "DV" (no body) when the dialog
+		// closes, but we don't need to react to that. Digit-guard so we
+		// don't match hypothetical future "DQK" etc.
+		s.applyNpcDialogOpen(pkt[2:])
 	}
 }
 
@@ -715,6 +724,36 @@ func (s *stateTracker) applyExchangeOpen(body string) {
 		"kind":   kind,
 		"target": target,
 		"ts":     time.Now().UnixMilli(),
+	})
+}
+
+// applyNpcDialogOpen parses "DQ<questionId>[;<npcId>]|<replyId>;..." body
+// (no leading "DQ") and publishes an "npc_dialog_open" event. Pure
+// notification -- no state change. Wire forms observed:
+//   DQ318;153|259;329      -> question=318, npc=153, replies=[259,329]
+//   DQ3837|3370;3382       -> question=3837, npc unknown, replies=[3370,3382]
+// The body before '|' is split on ';'; we read question (always present)
+// and npc (optional second field) but don't bother with the reply list.
+func (s *stateTracker) applyNpcDialogOpen(body string) {
+	head, _, _ := strings.Cut(body, "|")
+	if head == "" {
+		return
+	}
+	parts := strings.Split(head, ";")
+	question, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return
+	}
+	npc := 0
+	if len(parts) >= 2 {
+		npc = atoiSafe(parts[1])
+	}
+	log.Printf("[state] npc_dialog_open question=%d npc=%d", question, npc)
+	s.hub.Publish(map[string]interface{}{
+		"type":     "npc_dialog_open",
+		"question": question,
+		"npc":      npc,
+		"ts":       time.Now().UnixMilli(),
 	})
 }
 
