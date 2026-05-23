@@ -18,6 +18,16 @@ mkdir -p "$HOME/.vnc"
 # "Unable to load a failsafe session". Reclaim ownership before VNC starts.
 sudo chown -R bot:bot "$HOME/.config" || true
 
+# Pre-create the per-instance log directory as bot so the Python
+# fighter can open logs/<instance>/fighter.log for write. Without
+# this the sudo'd proxy launched below races and creates the dir
+# as root on the /workspace bind mount, and Python (UID 1000)
+# fails with EACCES at setup_logging(). The proxy itself runs as
+# root and can still write proxy.log into a bot-owned dir.
+INSTANCE="${FIGHTER_INSTANCE:-$(hostname)}"
+sudo mkdir -p "/workspace/logs/${INSTANCE}"
+sudo chown bot:bot "/workspace/logs/${INSTANCE}" || true
+
 # Password file. VNC truncates to 8 chars silently; that is fine
 # for a localhost-only bind, but worth knowing.
 # Ubuntu 22.04's `tigervnc-common` does NOT ship a standalone passwd
