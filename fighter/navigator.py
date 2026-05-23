@@ -10,6 +10,7 @@ import random
 import time
 
 from dofus.actions import click_cell
+from dofus.cell_grid import cell_to_screen
 from dofus.map_data import (
     DIRECTION_WORLD_DELTA,
     OPPOSITE_DIRECTION,
@@ -23,6 +24,12 @@ from utils import CFG
 EMPTY_MAP_RESPAWN_SEC = float(CFG.get("empty_map_respawn_sec", 240.0))
 MAP_CHANGE_TIMEOUT = 20.0
 STATUS_LOG_SEC = 5.0
+# After a map transition the Dofus client briefly drops input even after
+# my_cell repopulates -- the *next* click_cell on the new map silently
+# no-ops if fired too soon, and we time out waiting for the second map
+# change. Pause between switch-cell clicks across consecutive walk steps
+# so the client is input-ready when we click again.
+POST_MAP_CHANGE_SETTLE_SEC = float(CFG.get("post_map_change_settle_sec", 1.5))
 
 
 class MapNavigator:
@@ -255,17 +262,45 @@ class MapNavigator:
                   f"({entry.get('map_id')}); aborting")
             return (False, False)
         before_map = entry["map_id"]
-        print(f"[walk_to] walking {direction} from map={before_map} via "
-              f"switch cell={switch_cell}")
+        before_snap = self.state.snapshot()
+        before_cell = before_snap.my_cell
+        click_x, click_y = cell_to_screen(switch_cell, self.cal)
+        print(f"[walk_to] walking {direction} from map={before_map} "
+              f"my_cell={before_cell} via switch cell={switch_cell} "
+              f"click_xy=({click_x},{click_y})")
         click_cell(switch_cell, self.cal)
-        if not wait_for(
-            self.state,
-            lambda s, bm=before_map: (s.map_id != bm and s.map_id != 0)
-                                     or s.in_fight,
-            MAP_CHANGE_TIMEOUT,
-        ):
+        # Poll my_cell during the timeout so we can tell click-dropped
+        # (my_cell never changes) from partial-walk (my_cell changes but
+        # never reaches the switch / aborts on obstacle) when the map
+        # doesn't change in time.
+        t0 = time.time()
+        deadline = t0 + MAP_CHANGE_TIMEOUT
+        cell_changes = []  # [(elapsed_s, my_cell), ...] -- cap at 8 entries
+        prev_cell = before_cell
+        map_changed = False
+        while time.time() < deadline:
+            s = self.state.snapshot()
+            if (s.map_id != before_map and s.map_id != 0) or s.in_fight:
+                map_changed = True
+                break
+            if s.my_cell != prev_cell:
+                if len(cell_changes) < 8:
+                    cell_changes.append((round(time.time() - t0, 2), s.my_cell))
+                prev_cell = s.my_cell
+            time.sleep(0.1)
+        if not map_changed:
+            after_cell = self.state.snapshot().my_cell
+            if not cell_changes:
+                diag = (f"my_cell stayed at {before_cell} the entire "
+                        f"{MAP_CHANGE_TIMEOUT}s (click had ZERO effect -- "
+                        f"likely dropped, wrong pixel, or unreachable target)")
+            else:
+                diag = (f"my_cell moved {len(cell_changes)} time(s): "
+                        f"{cell_changes} ending on {after_cell} (click "
+                        f"landed but character couldn't reach switch_cell="
+                        f"{switch_cell})")
             print(f"[walk_to] walk {direction} did not change map in "
-                  f"{MAP_CHANGE_TIMEOUT}s")
+                  f"{MAP_CHANGE_TIMEOUT}s -- {diag}")
             return (False, False)
         post = self.state.snapshot()
         if post.in_fight:
@@ -282,6 +317,10 @@ class MapNavigator:
         wait_for(self.state, lambda s: s.my_cell != 0, 2.0, poll=0.05)
         new = self.state.snapshot()
         print(f"[walk_to] arrived on map_id={new.map_id}")
+        # Settle before returning -- the caller fires the next switch
+        # click immediately on success, and the post-transition client
+        # silently eats clicks for a short window.
+        time.sleep(POST_MAP_CHANGE_SETTLE_SEC)
         return (True, False)
 
     def _maybe_log_no_progress(self, snap, entry, switch_cells_map, safe,

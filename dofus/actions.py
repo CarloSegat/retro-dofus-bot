@@ -15,9 +15,8 @@ Verbs:
 """
 import time
 
-from dofus.cell_grid import cell_to_screen
+from dofus.cell_grid import cell_to_screen, cell_to_screen_fight, cell_to_subrow_pos
 from mouse_keyboard import (
-    click_at,
     click_at_focused,
     press,
     press_focused,
@@ -35,15 +34,32 @@ SPELL_AIM_SETTLE_SEC = 0.4
 # characters land in the game canvas instead of the chat input.
 CHAT_SETTLE_SEC = 0.3
 
+# Fraction of cell_h to bump the click upward when targeting the cell
+# that sits DIRECTLY NORTH of the caster on screen. In iso coords
+# that's the Po-distance-2 cell with same pos and sub_row - 2 (one
+# NW + one NE step); on screen its pixel center sits exactly one
+# cell_h above the caster's. The caster sprite extends up past that
+# point, so the click lands inside the sprite and Dofus resolves it
+# as a self-click -- spell stays armed and never fires (or fires on
+# us). Empirical: 15% of cell_h clears the sprite without overshooting.
+NORTH_ABOVE_Y_OFFSET_PCT = 0.15
+
 
 def click_cell(cell, cal):
     """Click the pixel center of `cell`. Used to walk a step (Dofus
-    interprets a click on a walkable cell as movement)."""
+    interprets a click on a walkable cell as movement).
+
+    Uses the focused variant (windowactivate --sync + click) so the
+    click goes through even when Dofus briefly lost X focus -- common
+    right after a map transition, where an unfocused click is silently
+    dropped and the bot stalls waiting for a map change that never
+    happens. The extra ~50ms of windowactivate is negligible vs the
+    20s timeout when the click is lost."""
     x, y = cell_to_screen(cell, cal)
-    click_at(x, y)
+    click_at_focused(x, y)
 
 
-def cast_at_cell(hotkey, cell, cal):
+def cast_at_cell(hotkey, cell, cal, caster_cell=None):
     """Cast a spell at `cell`: press the spell `hotkey`, wait for Dofus
     to enter spell-aim mode (show the reticle), then click the target
     cell with focus.
@@ -51,8 +67,23 @@ def cast_at_cell(hotkey, cell, cal):
     The click must be focused -- in spell-aim mode Dofus's spell handler
     silently drops un-focused clicks, leaving the spell armed but never
     firing (`my_ap` doesn't decrement). See CLAUDE.md and memory
-    feedback_spell_click_pynput.md."""
-    x, y = cell_to_screen(cell, cal)
+    feedback_spell_click_pynput.md.
+
+    If `caster_cell` is supplied and `cell` is the one sitting DIRECTLY
+    NORTH of the caster on screen (iso: same pos, sub_row - 2; Po
+    distance 2), the click is bumped up by `NORTH_ABOVE_Y_OFFSET_PCT`
+    of cell_h so it lands above the caster sprite (which would
+    otherwise eat the click as a self-click)."""
+    x, y = cell_to_screen_fight(cell, cal)
+    if caster_cell is not None:
+        t_sub, t_pos = cell_to_subrow_pos(cell)
+        c_sub, c_pos = cell_to_subrow_pos(caster_cell)
+        if t_pos == c_pos and t_sub == c_sub - 2:
+            dy = int(round(cal["cell_h"] * NORTH_ABOVE_Y_OFFSET_PCT))
+            print(f"  [cast_at_cell] N-above target_cell={cell} from "
+                  f"caster_cell={caster_cell}; bumping click up {dy}px "
+                  f"({NORTH_ABOVE_Y_OFFSET_PCT*100:.0f}% of cell_h)")
+            y -= dy
     press(hotkey)
     time.sleep(SPELL_AIM_SETTLE_SEC)
     click_at_focused(x, y)

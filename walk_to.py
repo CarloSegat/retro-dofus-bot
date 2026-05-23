@@ -18,22 +18,24 @@ Examples:
 Inspect the calibrated graph with `python3 nav_graph.py` if a path
 fails -- it lists missing edges and isolated maps.
 """
+import argparse
 import sys
 
+from fighter.logging_setup import setup_logging
 from fighter.orchestrator import Orchestrator
 
 
 def main():
-    if len(sys.argv) != 3:
-        print(f"usage: {sys.argv[0]} <world_x> <world_y>")
-        sys.exit(2)
-    try:
-        target = (int(sys.argv[1]), int(sys.argv[2]))
-    except ValueError:
-        print(f"world coords must be integers; got {sys.argv[1:]!r}")
-        sys.exit(2)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("world_x", type=int)
+    parser.add_argument("world_y", type=int)
+    parser.add_argument("--screen", default=None,
+                        help="calibration key in config.json[cell_calibrations]")
+    args = parser.parse_args()
+    target = (args.world_x, args.world_y)
 
-    orch = Orchestrator()
+    setup_logging()
+    orch = Orchestrator(screen_name=args.screen)
     print(f"[walk_to] target world {target}")
     ok = orch.navigator.walk_to_world(target, on_aggro=orch.combat.run)
     sys.exit(0 if ok else 1)

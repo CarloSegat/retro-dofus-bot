@@ -28,8 +28,27 @@ MENU_KEYWORDS = ("logout", "log out", "character selection", "quit", "exit")
 
 
 def grab_region(sct, x, y, w, h):
-    """RGB ndarray of a screen rectangle. `sct` is an mss.mss() instance."""
-    mon = {"left": x, "top": y, "width": w, "height": h}
+    """RGB ndarray of a screen rectangle. `sct` is an mss.mss() instance.
+
+    Clamps the requested rectangle to the virtual screen (sct.monitors[0]).
+    Without this, a region that pokes past the right/bottom edge of the
+    X server's root drawable (e.g. host-tuned game_area read on a smaller
+    VNC display) makes XGetImage() fail with "XGetImage() failed", which
+    bubbles up as a ScreenShotError and crashes the bot. We silently
+    return whatever portion is on-screen instead -- OCR on a clipped
+    rect is still useful and the alternative is a hard exit."""
+    screen = sct.monitors[0]
+    sx, sy = screen["left"], screen["top"]
+    sw, sh = screen["width"], screen["height"]
+    x1 = max(int(x), sx)
+    y1 = max(int(y), sy)
+    x2 = min(int(x) + int(w), sx + sw)
+    y2 = min(int(y) + int(h), sy + sh)
+    if x2 <= x1 or y2 <= y1:
+        # Whole requested rect is off-screen; return a 1x1 black pixel
+        # so downstream code (PIL, pytesseract) doesn't choke on empty.
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    mon = {"left": x1, "top": y1, "width": x2 - x1, "height": y2 - y1}
     img = np.array(sct.grab(mon))[:, :, :3]
     return img[:, :, ::-1]
 

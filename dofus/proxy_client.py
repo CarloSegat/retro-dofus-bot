@@ -141,16 +141,31 @@ class ProxyState:
 
     Reconnects automatically if the proxy goes down. Thread-safe."""
 
-    def __init__(self, addr="127.0.0.1:9999", reconnect_sec=2.0):
+    def __init__(self, addr="127.0.0.1:9999", reconnect_sec=2.0,
+                 stale_event_sec=120.0):
         host, port = addr.split(":")
         self._host = host
         self._port = int(port)
         self._reconnect_sec = reconnect_sec
+        # If the proxy stays connected but no event arrives for this many
+        # seconds (and we'd expect one -- map state, HP regen, fight tick
+        # etc.) we log a loud STALE marker. Useful when the Dofus client
+        # crashed or got kicked but the proxy's hub socket is still open.
+        self._stale_event_sec = stale_event_sec
         self._lock = threading.Lock()
         self._snap = Snapshot()
         self._thread = None
+        self._watchdog = None
         self._stop = threading.Event()
         self._on_event_callbacks = []
+        # When we've already shouted about a stale stream, suppress the
+        # repeat until events start flowing again (avoids spamming once
+        # per watchdog tick for hours).
+        self._stale_logged = False
+        # client_connected / client_disconnected come from the Go proxy
+        # when the Dofus<->Ankama game session opens/closes. Track the
+        # last state we logged to dedupe.
+        self._upstream_connected = None
 
     def start(self):
         if self._thread is not None:
@@ -158,12 +173,18 @@ class ProxyState:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True, name="proxy-eyes")
         self._thread.start()
+        self._watchdog = threading.Thread(target=self._watchdog_run, daemon=True,
+                                          name="proxy-watchdog")
+        self._watchdog.start()
 
     def stop(self):
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2)
             self._thread = None
+        if self._watchdog is not None:
+            self._watchdog.join(timeout=2)
+            self._watchdog = None
 
     def set_sitting(self, sitting: bool):
         """Local-only sit-state flag. Set True after the bot sends /sit;
@@ -209,10 +230,16 @@ class ProxyState:
         while not self._stop.is_set():
             try:
                 self._connect_and_read()
+                # for-loop ended cleanly = proxy closed our socket.
+                with self._lock:
+                    self._snap.connected = False
+                print(f"[proxy-eyes] DISCONNECT: proxy closed the event "
+                      f"socket; retrying in {self._reconnect_sec}s")
             except (ConnectionRefusedError, ConnectionResetError, OSError) as e:
                 with self._lock:
                     self._snap.connected = False
-                print(f"[proxy-eyes] connection lost: {e}; retrying in {self._reconnect_sec}s")
+                print(f"[proxy-eyes] DISCONNECT: connection lost ({e}); "
+                      f"retrying in {self._reconnect_sec}s")
             if self._stop.is_set():
                 break
             time.sleep(self._reconnect_sec)
@@ -224,6 +251,8 @@ class ProxyState:
             s.settimeout(None)
             with self._lock:
                 self._snap.connected = True
+                self._snap.last_event_ts = time.time()
+                self._stale_logged = False
             print(f"[proxy-eyes] connected to {self._host}:{self._port}")
             f = s.makefile("r", encoding="utf-8")
             for line in f:
@@ -243,11 +272,41 @@ class ProxyState:
                     except Exception as e:
                         print(f"[proxy-eyes] callback error: {e}")
 
+    def _watchdog_run(self):
+        """Loud-print when the Go proxy reports the Dofus client gave up,
+        and when the event stream goes quiet for too long. Runs every
+        few seconds so a "logged out at 04:13" marker is grep-able even
+        after long unattended runs."""
+        poll = max(2.0, min(self._stale_event_sec / 4.0, 10.0))
+        while not self._stop.wait(poll):
+            with self._lock:
+                connected = self._snap.connected
+                last_ts = self._snap.last_event_ts
+                stale_logged = self._stale_logged
+            if not connected:
+                # Reconnect loop already prints; nothing to add here.
+                continue
+            if last_ts <= 0:
+                continue
+            quiet = time.time() - last_ts
+            if quiet >= self._stale_event_sec and not stale_logged:
+                print(f"[proxy-eyes] STALE: no proxy events for "
+                      f"{quiet:.0f}s (threshold {self._stale_event_sec:.0f}s) "
+                      f"-- Dofus client may be hung / logged out")
+                with self._lock:
+                    self._stale_logged = True
+
     def _apply(self, ev):
         t = ev.get("type")
         now = time.time()
+        # client_connected / client_disconnected come from the Go proxy
+        # when the Dofus<->Ankama upstream session opens or closes.
+        # Handled outside the lock so the loud-print isn't held up.
+        if t in ("client_connected", "client_disconnected"):
+            self._handle_upstream_event(t, ev)
         with self._lock:
             self._snap.last_event_ts = now
+            self._stale_logged = False
             if t == "state":
                 self._snap.map_id = ev.get("map_id", 0)
                 self._snap.my_id = ev.get("my_id", 0)
@@ -313,3 +372,22 @@ class ProxyState:
                 self._snap.turn_started_at_ms = ev.get("ts", 0)
                 self._snap.turn_dur_ms = ev.get("dur_ms", 0)
                 self._snap.turn_started_local_ts = now
+
+    def _handle_upstream_event(self, t, ev):
+        """Log Dofus-client connect/disconnect events from the Go proxy.
+        These are the authoritative 'I got logged out' signal -- the
+        proxy itself sees the upstream TCP socket close before any
+        Python-side timeout fires."""
+        remote = ev.get("remote", "?")
+        is_up = (t == "client_connected")
+        with self._lock:
+            already = self._upstream_connected
+            self._upstream_connected = is_up
+        if already == is_up:
+            return
+        if is_up:
+            print(f"[proxy-eyes] upstream: Dofus client connected ({remote})")
+        else:
+            print(f"[proxy-eyes] DISCONNECT: Dofus client closed the "
+                  f"upstream session ({remote}) -- bot is effectively "
+                  f"logged out until the client reconnects")

@@ -2,7 +2,8 @@
 
 Pre-reqs:
   - Go proxy running on 127.0.0.1:9999 with my_id and map_id populated.
-  - config.json has cell_calibration.
+  - config.json has cell_calibrations for the active screen
+    (resolved via --screen, $FIGHTER_SCREEN, or default_screen).
   - The map_data Postgres DB is reachable (see docker-compose.yml).
 
 Usage:
@@ -75,6 +76,8 @@ def main():
     parser.add_argument("world_y", type=int)
     parser.add_argument("n", type=int, nargs="?", default=2,
                         help="number of starting cells to record (default 2)")
+    parser.add_argument("--screen", default=None,
+                        help="calibration key in config.json[cell_calibrations]")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--obs-only", action="store_true",
                       help="skip phases 1 and 2; only edit the obstacle list "
@@ -121,11 +124,8 @@ def main():
             print("[calibrate-map-cells] aborted.")
             sys.exit(0)
 
-    cfg = json.loads(CONFIG_PATH.read_text())
-    cal = cfg.get("cell_calibration")
-    if not cal:
-        print("missing cell_calibration in config.json.")
-        sys.exit(1)
+    from fighter.helpers import load_cal
+    cal = load_cal(args.screen)
     max_residual = max(cal["cell_w"], cal["cell_h"])
 
     state = ProxyState(PROXY_ADDR)

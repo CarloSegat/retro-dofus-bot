@@ -7,14 +7,15 @@ class brains can compose them without re-implementing.
 
 Two strategies layered:
 
-- `try_full_walk(target, ...)` — one click that spends all current MP
-  toward `target` in a single Dofus pathfind. Fastest happy path; bails
-  if the A* path is blocked by dynamic entities mid-way.
+- `try_full_walk(target, ...)` / `try_full_retreat(away_from, ...)` —
+  one click that spends all current MP toward `target` (or away from
+  `away_from`) in a single Dofus pathfind. Fastest happy path; bails
+  if the path is blocked or no valid destination exists.
 
-- step-by-step (inside `walk_toward` after a full-walk failure, and in
-  `walk_away`) — click one neighbour at a time, retry once on
-  unresponsive movement, and remember cells that didn't work this turn
-  in `recent_failed` so we don't keep banging the same blocked cell.
+- step-by-step (inside `walk_toward` / `walk_away` after a full-walk
+  failure) — click one neighbour at a time, retry once on unresponsive
+  movement, and remember cells that didn't work this turn in
+  `recent_failed` so we don't keep banging the same blocked cell.
 
 `pick_next_step` and `pick_retreat_step` are the pure picks (no clicks
 issued); they're exported because callers occasionally need to ask
@@ -38,7 +39,8 @@ Config knobs (read from `utils.CFG`, default in parens):
 import time
 
 from dofus.cell_grid import (
-    a_star, cell_distance, cell_to_screen, neighbors, on_map,
+    a_star, cell_distance, cell_to_screen_fight, neighbors, on_map,
+    reachable_within,
 )
 from mouse_keyboard import click_at
 from fighter.helpers import my_fight_cell, wait_for
@@ -147,13 +149,88 @@ def _wait_movement(state, before, timeout):
     )
 
 
+def try_full_retreat(away_from, state, cal, static_obstacles=(),
+                     mp_override=None, walk_wait_sec=None):
+    """Single-click retreat: BFS cells reachable within MP budget, pick
+    the one that maximizes Po distance from `away_from` (tie-break: fewest
+    steps), and click it so Dofus's pathfinder walks the whole retreat
+    in one animation. Returns (success, me_cell, mp_remaining,
+    pending_settle_sec). success=False if no reachable cell strictly
+    increases distance from `away_from` -- caller falls back to
+    step-by-step. Live entities are also blocked so we don't try to
+    walk through a mob."""
+    walk_wait = walk_wait_sec if walk_wait_sec is not None else WALK_STEP_WAIT_SEC
+    snap = state.snapshot()
+    me = snap.fight_entities.get(snap.my_id)
+    mp = mp_override if mp_override is not None else (me.mp if me else 0)
+    me_cell = my_fight_cell(snap)
+    if mp <= 0 or not me_cell:
+        return False, me_cell, mp, 0.0
+
+    obs_set = set(static_obstacles)
+    dynamic = {
+        e.cell for e in snap.fight_entities.values()
+        if e.alive and e.cell > 0 and e.cell != me_cell
+    }
+    reachable = reachable_within(me_cell, mp, blocked=obs_set | dynamic)
+    current_dist = cell_distance(me_cell, away_from)
+    best = None  # ((-d_away, steps), cell, steps, d_away)
+    for cell, steps in reachable.items():
+        if cell == me_cell:
+            continue
+        d_away = cell_distance(cell, away_from)
+        if d_away <= current_dist:
+            continue
+        key = (-d_away, steps)
+        if best is None or key < best[0]:
+            best = (key, cell, steps, d_away)
+    if best is None:
+        print(f"  [full_retreat] me={me_cell} no cell within mp={mp} "
+              f"strictly increases dist from {away_from} "
+              f"(current={current_dist}, reachable={len(reachable) - 1}, "
+              f"static={len(obs_set)}, dyn={len(dynamic)})")
+        return False, me_cell, mp, 0.0
+
+    _, dest_cell, steps, d_away = best
+    sx, sy = cell_to_screen_fight(dest_cell, cal)
+    print(f"  FULL RETREAT from {me_cell} -> cell={dest_cell} ({sx},{sy}) "
+          f"[mp={mp} planned_steps={steps} dist_now={current_dist} "
+          f"dist_new={d_away} away_from={away_from}]")
+    click_at(sx, sy)
+    moved = _wait_movement(state, me_cell, walk_wait)
+    if not moved:
+        print(f"    full retreat from {me_cell} -> cell={dest_cell} "
+              f"({sx},{sy}) produced no movement in {walk_wait}s; "
+              f"caller falls back to step-by-step")
+        return False, me_cell, mp, 0.0
+
+    pending_settle = max(WALK_STEP_SETTLE_SEC * steps, FULL_WALK_SETTLE_FLOOR_SEC)
+    new_cell = my_fight_cell(state.snapshot()) or me_cell
+    mp_used = cell_distance(me_cell, new_cell)
+    remaining = mp - mp_used
+    print(f"    full retreat landed {new_cell} (mp_used={mp_used} "
+          f"mp_left~{remaining} pending_settle={pending_settle:.2f}s)")
+    return True, new_cell, remaining, pending_settle
+
+
 def walk_away(away_from, state, cal, static_obstacles, max_steps):
-    """Step-by-step retreat. Picks neighbours that strictly increase Po
-    distance. Stops at max_steps, no MP, no valid neighbour, or movement
-    failure. Returns (me_cell, mp_remaining, pending_settle)."""
+    """Retreat from `away_from`. First tries `try_full_retreat` (single
+    click, Dofus pathfinder eats the whole walk); falls back to
+    step-by-step on failure (no movement, blocked path, or no cell
+    strictly increases distance). Returns (me_cell, mp_remaining,
+    pending_settle)."""
+    if max_steps <= 0:
+        snap0 = state.snapshot()
+        return my_fight_cell(snap0), 0, 0.0
+
+    full_ok, new_cell, mp_remaining, pending = try_full_retreat(
+        away_from, state, cal, static_obstacles, mp_override=max_steps)
+    if full_ok:
+        return new_cell, mp_remaining, pending
+
     initial = state.snapshot()
     me0 = initial.fight_entities.get(initial.my_id)
-    estimated_mp = me0.mp if me0 else 0
+    estimated_mp = min(me0.mp if me0 else 0, max_steps)
     me_cell = my_fight_cell(initial)
     recent_failed = set()
     steps_taken = 0
@@ -167,7 +244,7 @@ def walk_away(away_from, state, cal, static_obstacles, max_steps):
             break
         if steps_taken > 0:
             time.sleep(WALK_STEP_SETTLE_SEC)
-        sx, sy = cell_to_screen(step, cal)
+        sx, sy = cell_to_screen_fight(step, cal)
         print(f"  RETREAT {steps_taken + 1}/{max_steps} from {me_cell} -> "
               f"cell={step} ({sx},{sy}) [mp_left~{estimated_mp}]")
         before = me_cell
@@ -243,7 +320,7 @@ def try_full_walk(target_cell, state, cal, static_obstacles=(), mp_override=None
         print(f"    [full_walk] WARNING dest_cell={dest_cell} is in static "
               f"obstacles ({sorted(obs_set & set(path))} appear on path); "
               f"clicking anyway, expect Dofus to reject")
-    sx, sy = cell_to_screen(dest_cell, cal)
+    sx, sy = cell_to_screen_fight(dest_cell, cal)
     print(f"  FULL WALK from {me_cell} -> cell={dest_cell} ({sx},{sy}) "
           f"[mp={mp} planned_steps={max_steps} target={target_cell}]")
     click_at(sx, sy)
@@ -313,7 +390,7 @@ def walk_toward(target_cell, state, cal, static_obstacles=(), mp_override=None,
         if steps_taken > 0:
             time.sleep(WALK_STEP_SETTLE_SEC)
 
-        sx, sy = cell_to_screen(step, cal)
+        sx, sy = cell_to_screen_fight(step, cal)
         print(f"  STEP {steps_taken + 1}/{WALK_MAX_STEPS} from {me_cell} -> cell={step} "
               f"({sx},{sy}) [mp_left~{estimated_mp} dist={dist}]")
         before = me_cell

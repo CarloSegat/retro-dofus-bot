@@ -2,7 +2,8 @@
 
 Pre-reqs:
   - Go proxy running on 127.0.0.1:9999 with map_id populated.
-  - config.json has cell_calibration.
+  - config.json has cell_calibrations for the active screen
+    (resolved via --screen, $FIGHTER_SCREEN, or default_screen).
   - The map_data Postgres DB is reachable.
 
 Usage:
@@ -66,14 +67,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("world_x", type=int)
     parser.add_argument("world_y", type=int)
+    parser.add_argument("--screen", default=None,
+                        help="calibration key in config.json[cell_calibrations]")
     args = parser.parse_args()
     start_world = (args.world_x, args.world_y)
 
-    cfg = json.loads(CONFIG_PATH.read_text())
-    cal = cfg.get("cell_calibration")
-    if not cal:
-        print("missing cell_calibration in config.json.")
-        sys.exit(1)
+    from fighter.helpers import load_cal
+    cal = load_cal(args.screen)
     max_residual = max(cal["cell_w"], cal["cell_h"])
 
     state = ProxyState(PROXY_ADDR)

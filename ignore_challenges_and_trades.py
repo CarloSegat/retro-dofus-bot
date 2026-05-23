@@ -1,5 +1,4 @@
 """Standalone: poll for trade/challenge dialog and click Ignore. Esc stops."""
-import os
 import time
 import mss
 from mouse_keyboard import EscStop
@@ -11,7 +10,7 @@ def run():
     esc = EscStop()
     poll = CFG.get("dialog_poll_sec", 1.0)
     print("[ignore] running. Press Esc to stop.")
-    with mss.mss(backend=os.environ.get("MSS_BACKEND", "default")) as sct:
+    with mss.mss() as sct:
         ctx = make_ctx(sct)
         while not esc.stop:
             dismiss_dialog(ctx)

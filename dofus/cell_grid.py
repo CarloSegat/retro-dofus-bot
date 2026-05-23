@@ -55,6 +55,30 @@ def cell_to_screen(cell, cal):
                       cal["cell_w"], cal["cell_h"])
 
 
+# In fight mode a permanent bottom-right UI panel covers parts of these
+# cells; their geometric center lands inside the panel, so a centered
+# click is eaten by the UI. Nudging the click toward the visible portion
+# of the cell lets it through. Out of fight the panel isn't drawn, so
+# callers outside combat must keep using cell_to_screen() directly.
+FIGHT_CELL_CLICK_OFFSETS_PCT = {
+    462: (-0.25, 0.0),  # 25% of cell_w left of center
+    463: (0.0, -0.25),  # 25% of cell_h above center
+}
+
+
+def cell_to_screen_fight(cell, cal):
+    """Like cell_to_screen but applies in-fight UI-overlap offsets for
+    cells listed in FIGHT_CELL_CLICK_OFFSETS_PCT. Use only from fight-
+    only click sites (cast_at_cell, in-combat walking)."""
+    x, y = cell_to_screen(cell, cal)
+    off = FIGHT_CELL_CLICK_OFFSETS_PCT.get(cell)
+    if off:
+        dx_pct, dy_pct = off
+        x += int(round(cal["cell_w"] * dx_pct))
+        y += int(round(cal["cell_h"] * dy_pct))
+    return x, y
+
+
 def xy_to_cell(x, y, origin_x, origin_y, cell_w, cell_h, max_sub_row=42):
     """Inverse of cell_to_xy. Returns (cell_id, residual_px) -- the cell
     whose center is closest to (x, y) under the given calibration. The

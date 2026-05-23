@@ -220,7 +220,7 @@ class Sacrieur:
                     time.sleep(pending_settle + SWAP_POST_WALK_EXTRA_SETTLE_SEC)
                     pending_settle = 0.0
                 old_cell = me_cell
-                self._cast_swap(swap_target.cell)
+                self._cast_swap(swap_target.cell, me_cell)
                 time.sleep(CAST_WAIT_SEC)
                 my_ap -= SWAP_AP_COST
                 me_cell = self._me_cell_after_swap(old_cell, swap_target.cell)
@@ -254,7 +254,7 @@ class Sacrieur:
                 if pending_settle > 0:
                     time.sleep(pending_settle + ATTRACTION_POST_WALK_EXTRA_SETTLE_SEC)
                     pending_settle = 0.0
-                self._cast_attraction(target.cell)
+                self._cast_attraction(target.cell, me_cell)
                 time.sleep(CAST_WAIT_SEC)
                 my_ap -= ATTRACTION_AP_COST
                 if self.dist_tracker.tofu_detected:
@@ -297,6 +297,30 @@ class Sacrieur:
                 print(f"  vital: on cooldown ({turns_since_vital}/"
                       f"{VITAL_COOLDOWN_TURNS} turns since last cast on "
                       f"turn {self.last_vital_turn})")
+
+        # Escape swap: low-AP turn (can't Dissolution) but Swap still
+        # fits (>= SWAP_AP_COST). Jump to whichever adjacent-enemy cell
+        # is farthest from the enemy centroid -- trading the leftover
+        # 2-3 AP for a step away from the cluster reduces incoming
+        # damage next round. Bold + Vital + Attraction have already
+        # had their chance above; this is the last AP user before pass.
+        # Gated on ap < DISSOLUTION_AP_COST so we never pre-empt a
+        # damage cast (if AP >= 4 and adjacent, Dissolution already
+        # fired above).
+        if (self.state.snapshot().in_combat and me_cell
+                and SWAP_AP_COST <= my_ap < DISSOLUTION_AP_COST):
+            escape_target = self._pick_escape_swap_target(me_cell)
+            if escape_target is not None:
+                if pending_settle > 0:
+                    time.sleep(pending_settle + SWAP_POST_WALK_EXTRA_SETTLE_SEC)
+                    pending_settle = 0.0
+                old_cell = me_cell
+                self._cast_swap(escape_target.cell, me_cell)
+                time.sleep(CAST_WAIT_SEC)
+                my_ap -= SWAP_AP_COST
+                me_cell = self._me_cell_after_swap(old_cell, escape_target.cell)
+                print(f"  escape-swap landed: me_cell {old_cell} -> {me_cell} "
+                      f"(ap_left~{my_ap})")
 
         if not self.state.snapshot().in_combat:
             return
@@ -364,7 +388,7 @@ class Sacrieur:
                 if pending_settle > 0:
                     time.sleep(pending_settle + ATTRACTION_POST_WALK_EXTRA_SETTLE_SEC)
                     pending_settle = 0.0
-                self._cast_attraction(target.cell)
+                self._cast_attraction(target.cell, me_cell)
                 time.sleep(CAST_WAIT_SEC)
                 my_ap -= ATTRACTION_AP_COST
                 if self.dist_tracker.tofu_detected:
@@ -415,14 +439,15 @@ class Sacrieur:
         print(f"  CAST Vital Punishment hotkey={VITAL_HOTKEY!r} self_cell={my_cell}")
         cast_at_cell(VITAL_HOTKEY, my_cell, self.cal)
 
-    def _cast_swap(self, target_cell):
+    def _cast_swap(self, target_cell, me_cell):
         print(f"  CAST Swap hotkey={SWAP_HOTKEY!r} target_cell={target_cell}")
-        cast_at_cell(SWAP_HOTKEY, target_cell, self.cal)
+        cast_at_cell(SWAP_HOTKEY, target_cell, self.cal, caster_cell=me_cell)
 
-    def _cast_attraction(self, target_cell):
+    def _cast_attraction(self, target_cell, me_cell):
         print(f"  CAST Attraction hotkey={ATTRACTION_HOTKEY!r} "
               f"target_cell={target_cell}")
-        cast_at_cell(ATTRACTION_HOTKEY, target_cell, self.cal)
+        cast_at_cell(ATTRACTION_HOTKEY, target_cell, self.cal,
+                     caster_cell=me_cell)
 
     # --- Attraction targeting ---
 
@@ -517,6 +542,57 @@ class Sacrieur:
               f"(cells={[e.cell for e in nearby]}); casting swap "
               f"(my_ap={my_ap} >= {SWAP_MIN_AP})")
         return target
+
+    def _pick_escape_swap_target(self, me_cell):
+        """Returns an adjacent enemy whose cell is strictly farther from
+        the enemy centroid than our current cell, or None.
+
+        Escape valve for low-AP turns: when Dissolution can't fire
+        (ap < 4) but Swap can (ap >= 2), trade the leftover AP for a
+        step away from the enemy cluster. Centroid is computed in iso
+        (u, v) coords (matching how `cell_distance` measures range),
+        and we pick the adjacent-enemy cell whose L1 distance to the
+        centroid is greatest -- swapping there puts us as far from the
+        cluster as one swap allows. Only fires if the candidate's
+        distance strictly exceeds our current distance (otherwise the
+        swap moves us no farther from the centroid than we already are).
+
+        With <2 alive enemies the centroid degenerates: the only other
+        enemy IS the swap target, so we'd land where they were and
+        they'd land where we were -- still adjacent, net zero. Skip."""
+        snap = self.state.snapshot()
+        enemies = alive_enemies(snap)
+        if len(enemies) < 2:
+            return None
+        adjacent = [e for e in enemies if cell_distance(me_cell, e.cell) == 1]
+        if not adjacent:
+            return None
+
+        uvs = [cell_to_uv(e.cell) for e in enemies]
+        cu = sum(u for u, _ in uvs) / len(uvs)
+        cv = sum(v for _, v in uvs) / len(uvs)
+
+        def d_from_centroid(cell):
+            u, v = cell_to_uv(cell)
+            return abs(u - cu) + abs(v - cv)
+
+        cur_d = d_from_centroid(me_cell)
+        best = None
+        best_d = cur_d
+        for e in adjacent:
+            d = d_from_centroid(e.cell)
+            if d > best_d:
+                best = e
+                best_d = d
+        if best is None:
+            print(f"  escape-swap: no adjacent enemy improves distance from "
+                  f"centroid ({cu:.2f}, {cv:.2f}); cur_d={cur_d:.2f}, "
+                  f"adjacent={[(e.id, e.cell) for e in adjacent]}; skipping")
+            return None
+        print(f"  escape-swap: target id={best.id} cell={best.cell} moves "
+              f"us {cur_d:.2f} -> {best_d:.2f} from enemy centroid "
+              f"({cu:.2f}, {cv:.2f})")
+        return best
 
     def _me_cell_after_swap(self, old_cell, target_cell):
         """Resolve our cell after a swap cast. The proxy parses GA;4;
