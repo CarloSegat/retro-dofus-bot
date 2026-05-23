@@ -221,6 +221,20 @@
   "enutrof_coins_max_range": 13,
   "enutrof_coins_post_walk_settle_sec": 0.33,
   "enutrof_cast_wait_sec": 0.8,
+  "ecaflip_heads_or_tails_hotkey": "1",
+  "ecaflip_heads_or_tails_ap_cost": 3,
+  "ecaflip_heads_or_tails_min_range": 1,
+  "ecaflip_heads_or_tails_max_range": 6,
+  "ecaflip_heads_or_tails_post_walk_settle_sec": 0.33,
+  "ecaflip_perception_hotkey": "5",
+  "ecaflip_perception_ap_cost": 2,
+  "ecaflip_perception_cooldown_turns": 3,
+  "ecaflip_all_or_nothing_hotkey": "6",
+  "ecaflip_all_or_nothing_ap_cost": 5,
+  "ecaflip_all_or_nothing_cooldown_turns": 4,
+  "ecaflip_all_or_nothing_trigger_range": 8,
+  "ecaflip_all_or_nothing_trigger_count": 2,
+  "ecaflip_cast_wait_sec": 0.8,
   "sacrid_walk_wait_sec": 2.0,
   "sacrid_walk_step_wait_sec": 2.5,
   "sacrid_walk_max_steps": 6,
@@ -228,6 +242,8 @@
   "empty_map_respawn_sec": 1.5,
   "tofu_detect_threshold": 4,
   "tofu_detect_required_cycles": 3,
+  "turn_wait_timeout_sec": 180,
+  "watchdog_idle_no_progress_sec": 300,
   "interval_sec": 0.4,
   "jitter_sec": 0.1,
   "post_click_wait_sec": 0.4,
@@ -278,13 +294,43 @@
   "dialog_dismiss_wait_sec": 0.5,
   "dialog_poll_sec": 1.0,
   "dialog_check_interval_sec": 4,
-  "cell_calibration": {
-    "origin_x": 1074.4206521739134,
-    "origin_y": 90.82832618025765,
-    "cell_w": 58.03260869565217,
-    "cell_h": 30.85264663805436,
-    "residual_px": 11.497825881443848,
-    "samples": 5,
-    "fitted_at": "2026-05-15 13:54:09"
+  "default_screen": "noVNC",
+  "cell_calibrations": {
+    "noVNC": {
+      "origin_x": 331.6887608069164,
+      "origin_y": 67.5468451242828,
+      "cell_w": 67.71757925072048,
+      "cell_h": 34.60038240917782,
+      "residual_px": 2.6457513110645907,
+      "samples": 4,
+      "fitted_at": "2026-05-21 07:23:11"
+    }
+  },
+  "restart_clicks": {
+    "noVNC": {
+      "play_button": [
+        187,
+        411
+      ],
+      "server_first": [
+        499,
+        458
+      ],
+      "character_first": [
+        492,
+        522
+      ],
+      "calibrated_at": "2026-05-23 10:39:16",
+      "post_launcher_calibrated_at": "2026-05-23 12:07:54"
+    }
+  },
+  "fight_ui_dismiss_clicks": {
+    "noVNC": {
+      "collapse_turn_order": [
+        1269,
+        146
+      ],
+      "calibrated_at": "2026-05-23 12:36:36"
+    }
   }
 }
