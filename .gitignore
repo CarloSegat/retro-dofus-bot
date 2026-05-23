@@ -7,3 +7,11 @@ debug/
 # Dofus Retro installer AppImage — baked into the desktop image via
 # desktop/Dockerfile COPY, never committed (288 MB).
 desktop/Retro-Setup-x86_64.AppImage
+# Rotating log files (fighter.log + dated rotations). Written by
+# fighter/logging_setup.py at runtime.
+logs/
+# Persisted last-run settings; rewritten by Orchestrator on every
+# startup so --auto-reuse can resume non-interactively.
+.last_run.json
+# Accumulated fight-duration stats appended by the bot at runtime.
+data/stats.json
